@@ -4,6 +4,7 @@ import unittest
 from argparse import Namespace
 
 from mlbench.cli import _device_indices, _parse_suites, _selected_backends, _validate_arguments
+from mlbench.power import _json_power, _text_power, add_power_details
 from mlbench.stats import percentile
 
 
@@ -35,10 +36,25 @@ class SelectionTests(unittest.TestCase):
             batch_size=0,
             warmup=0,
             npu_streams=1,
+            power_interval=0.1,
             backend="cpu",
         )
         with self.assertRaises(ValueError):
             _validate_arguments(arguments, {"compute"})
+
+
+class PowerTests(unittest.TestCase):
+    def test_amd_json_power(self):
+        payload = [{"gpu": 0, "power": {"socket_power": {"value": 125, "unit": "W"}}}]
+        self.assertEqual(_json_power(payload), 125.0)
+
+    def test_text_power_units(self):
+        self.assertEqual(_text_power("Average Package Power: 75000 mW"), 75.0)
+
+    def test_efficiency(self):
+        result = {"value": 100.0, "unit": "images/s", "details": {}}
+        add_power_details(result, {"status": "ok", "average_w": 20.0})
+        self.assertEqual(result["details"]["efficiency"]["value"], 5.0)
 
 
 if __name__ == "__main__":

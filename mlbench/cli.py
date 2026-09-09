@@ -39,6 +39,8 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--device", default="all", help="GPU 编号，如 0 或 0,1")
     run.add_argument("--npu-streams", type=int, default=1, help="NPU 并发请求数")
     run.add_argument("--npu-config", default=None, help="可选 VitisAI EP config_file")
+    run.add_argument("--no-power", action="store_true", help="关闭加速器功耗采样")
+    run.add_argument("--power-interval", type=float, default=0.1, help="功耗采样间隔秒数，默认 0.1")
     run.add_argument("--output-dir", default="results", help="报告与 NPU 缓存目录")
     run.add_argument("--json-only", action="store_true", help="控制台只输出 JSON")
     run.add_argument("--verbose", action="store_true", help="失败时输出调用栈")
@@ -90,6 +92,8 @@ def _validate_arguments(args: argparse.Namespace, suites: set[str]) -> None:
         raise ValueError("warmup 不能小于 0")
     if args.npu_streams < 1:
         raise ValueError("npu-streams 必须至少为 1")
+    if args.power_interval <= 0:
+        raise ValueError("power-interval 必须大于 0")
     if args.backend == "npu" and "inference" not in suites:
         raise ValueError("AMD NPU 当前仅支持 inference suite")
     if args.backend == "cpu" and suites == {"inference"}:
@@ -108,6 +112,7 @@ def _run(args: argparse.Namespace) -> int:
         print(render_doctor(environment))
         print(f"\n即将测试   : {', '.join(backends)}")
         print(f"测试档位   : {args.profile}")
+        print(f"功耗采样   : {'关闭' if args.no_power else f'开启 ({args.power_interval:.2f}s)'}")
 
     for backend in backends:
         if backend in {"cuda", "rocm"}:
@@ -123,6 +128,8 @@ def _run(args: argparse.Namespace) -> int:
                     args.matrix_size,
                     args.batch_size,
                     args.warmup,
+                    not args.no_power,
+                    args.power_interval,
                 )
             )
         elif backend == "npu":
@@ -136,6 +143,8 @@ def _run(args: argparse.Namespace) -> int:
                         args.warmup,
                         args.npu_streams,
                         args.npu_config,
+                        not args.no_power,
+                        args.power_interval,
                     )
                 )
         elif backend == "cpu":

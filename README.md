@@ -1,6 +1,6 @@
 # Heterogeneous MLBench
 
-一个面向 **NVIDIA GPU、AMD GPU（ROCm）和 AMD Ryzen AI NPU** 的一键 ML 算力测试工具。它会自动识别本机可用后端，在同一份报告里输出矩阵算力、显存带宽和 CNN 推理吞吐。
+一个面向 **NVIDIA GPU、AMD GPU（ROCm）和 AMD Ryzen AI NPU** 的一键 ML 算力测试工具。它会自动识别本机可用后端，在同一份报告里输出矩阵算力、显存带宽、CNN 推理吞吐、功耗与性能每瓦。
 
 ## 一键运行
 
@@ -17,7 +17,7 @@ Windows PowerShell：
 .\benchmark.ps1
 ```
 
-默认使用 `standard` 档位，结果写入 `results/mlbench_*.json` 和 `results/mlbench_*.md`。第一次运行可能创建 `.venv` 并安装 NumPy/PyTorch；驱动和 ROCm/Ryzen AI 系统运行时不会被脚本擅自修改。
+默认使用 `standard` 档位并以 100 ms 间隔采样功耗，结果写入 `results/mlbench_*.json` 和 `results/mlbench_*.md`。第一次运行可能创建 `.venv` 并安装 NumPy/PyTorch；驱动和 ROCm/Ryzen AI 系统运行时不会被脚本擅自修改。
 
 快速冒烟测试：
 
@@ -35,9 +35,9 @@ Windows PowerShell：
 
 | 硬件 | 执行后端 | 默认项目 |
 |---|---|---|
-| NVIDIA GPU | PyTorch CUDA | FP32/TF32/FP16/BF16 GEMM、显存拷贝、CNN 推理 |
-| AMD GPU | PyTorch HIP/ROCm | FP32/FP16/BF16 GEMM、显存拷贝、CNN 推理 |
-| AMD Ryzen AI NPU | ONNX Runtime VitisAI EP | 静态 CNN 吞吐、P50/P95 延迟、首次编译时间 |
+| NVIDIA GPU | PyTorch CUDA + `nvidia-smi` | FP32/TF32/FP16/BF16 GEMM、显存拷贝、CNN 推理、功耗 |
+| AMD GPU | PyTorch HIP/ROCm + `amd-smi`/`rocm-smi` | FP32/FP16/BF16 GEMM、显存拷贝、CNN 推理、功耗 |
+| AMD Ryzen AI NPU | ONNX Runtime VitisAI EP + `xrt-smi` | 静态 CNN 吞吐、P50/P95 延迟、首次编译时间、可用时的功耗 |
 | CPU 回退 | NumPy | FP32 GEMM、内存拷贝 |
 
 PyTorch 的 ROCm 版本沿用 `torch.cuda` Python API，所以 GPU 基准核心不需要维护两份实现。NPU 使用 ONNX opset 17 的静态合成 CNN，首次运行会由 VitisAI EP 编译并缓存。
@@ -114,6 +114,10 @@ source /opt/xilinx/xrt/setup.sh
 # NPU 多路并发吞吐
 ./benchmark.sh --backend npu --npu-streams 4 --duration 10
 
+# 调整功耗采样间隔，或完全关闭功耗采样
+./benchmark.sh --power-interval 0.2
+./benchmark.sh --no-power
+
 # 仅输出机器可读 JSON
 ./benchmark.sh --profile quick --json-only
 
@@ -137,6 +141,8 @@ PYTHONPATH=. python -m mlbench run --backend cpu --profile quick
 - `device_copy`：一次拷贝按一次读取加一次写入计算 GB/s，不等同于厂商标称显存带宽。
 - `synthetic_cnn`：固定 224×224 输入的四层卷积网络端到端吞吐，单位 images/s。
 - `synthetic_cnn_latency`：NPU 同步推理 P50；P95 和均值写在 JSON 的 `details` 中。
+- `idle_power`：负载开始前的平均功耗；负载平均/峰值功耗和估算能耗写入每项结果的 `details.power`。
+- `details.efficiency`：当前性能除以负载平均功耗，例如 TFLOP/s/W、images/s/W。
 - 不同精度、batch、驱动、功耗模式和散热状态的结果不能直接混为同一排名。
 
 ## 说明与限制
@@ -144,6 +150,7 @@ PYTHONPATH=. python -m mlbench run --backend cpu --profile quick
 - 一份 PyTorch wheel 只绑定一种 GPU 运行时；同机同时装有 NVIDIA GPU 和 AMD GPU 时，需要分别使用 CUDA 与 ROCm Python 环境运行，生成的 JSON 可后续合并比较。
 - AMD NPU 是推理加速器，本工具不会对其运行 PyTorch 训练或通用 GEMM 测试。
 - NPU 首次模型编译时间单独记录，不计入稳定态吞吐；缓存放在 `results/cache/`。
+- 功耗来自驱动遥测而非外置功率计；NPU 平台若不暴露 electrical/telemetry 传感器，会明确标记为跳过。
 - `quick` 用于验证，`standard` 用于日常比较，`extended` 用于较稳定的长时间测量。
 
 ## 官方运行时文档
@@ -153,3 +160,6 @@ PYTHONPATH=. python -m mlbench run --backend cpu --profile quick
 - [AMD ROCm PyTorch 安装](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/install/installrad/native_linux/install-pytorch.html)
 - [Ryzen AI Linux 安装](https://ryzenai.docs.amd.com/en/latest/linux.html)
 - [Ryzen AI VitisAI EP 模型运行](https://ryzenai.docs.amd.com/en/latest/modelrun.html)
+- [NVIDIA SMI 查询字段](https://docs.nvidia.com/deploy/nvidia-smi/index.html)
+- [AMD SMI CLI](https://rocm.docs.amd.com/projects/amdsmi/en/latest/how-to/amdsmi-cli-tool.html)
+- [XRT SMI electrical/telemetry](https://xilinx.github.io/XRT/master/html/xrt-smi.html)

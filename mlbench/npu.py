@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .power import PowerSampler, add_power_details, idle_result, make_power_reader, sample_idle_power
 from .stats import mean, percentile
 
 
@@ -87,6 +88,8 @@ def run_npu_benchmarks(
     warmup: int,
     streams: int,
     config_file: str | None,
+    power_enabled: bool,
+    power_interval: float,
 ) -> list[dict[str, Any]]:
     import numpy as np
     import onnxruntime as ort
@@ -134,6 +137,14 @@ def run_npu_benchmarks(
     for _ in range(warmup):
         session.run(None, feed)
 
+    device = "AMD NPU / VitisAIExecutionProvider"
+    power_reader = make_power_reader("npu") if power_enabled else None
+    results = []
+    if power_enabled:
+        results.append(idle_result("npu", device, sample_idle_power(power_reader, power_interval)))
+
+    sampler = PowerSampler(power_reader, power_interval)
+    sampler.start()
     started = time.perf_counter()
     latencies: list[float] = []
 
@@ -150,12 +161,13 @@ def run_npu_benchmarks(
         for future in futures:
             latencies.extend(future.result())
     elapsed = time.perf_counter() - started
+    power = sampler.stop(elapsed)
     iterations = len(latencies)
     throughput = iterations * active_batch / elapsed
 
     common = {
         "backend": "npu",
-        "device": "AMD NPU / VitisAIExecutionProvider",
+        "device": device,
         "suite": "inference",
         "test": "synthetic_cnn",
         "precision": "fp32-input/auto",
@@ -176,5 +188,7 @@ def run_npu_benchmarks(
         mean_ms=mean(latencies),
         p95_ms=percentile(latencies, 95),
     )
-    return [throughput_result, latency_result]
-
+    add_power_details(throughput_result, power)
+    add_power_details(latency_result, power)
+    results.extend([throughput_result, latency_result])
+    return results

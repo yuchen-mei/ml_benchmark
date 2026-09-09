@@ -6,6 +6,8 @@ import time
 from contextlib import contextmanager
 from typing import Any, Callable
 
+from .power import PowerReader, PowerSampler, add_power_details, idle_result, make_power_reader, sample_idle_power
+
 
 def _result(
     backend: str,
@@ -75,7 +77,14 @@ def _matmul_mode(torch: Any, backend: str, tf32: bool):
             cudnn.allow_tf32 = original_cudnn
 
 
-def _time_gpu_operation(torch: Any, operation: Callable[[], Any], duration: float, warmup: int) -> tuple[float, int]:
+def _time_gpu_operation(
+    torch: Any,
+    operation: Callable[[], Any],
+    duration: float,
+    warmup: int,
+    power_reader: PowerReader | None,
+    power_interval: float,
+) -> tuple[float, int, dict[str, Any] | None]:
     for _ in range(warmup):
         operation()
     torch.cuda.synchronize()
@@ -91,15 +100,31 @@ def _time_gpu_operation(torch: Any, operation: Callable[[], Any], duration: floa
     pilot_seconds = max(start.elapsed_time(end) / 1000.0, 1e-6)
     runs = max(10, min(10000, math.ceil(duration / pilot_seconds * pilot_runs)))
 
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(runs):
-        operation()
-    end.record()
-    torch.cuda.synchronize()
-    elapsed_seconds = start.elapsed_time(end) / 1000.0
-    return elapsed_seconds, runs
+    sampler = PowerSampler(power_reader, power_interval)
+    sampler.start()
+    elapsed_seconds = 0.0
+    total_runs = 0
+    chunk_runs = runs
+    for _ in range(4):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(chunk_runs):
+            operation()
+        end.record()
+        torch.cuda.synchronize()
+        chunk_seconds = start.elapsed_time(end) / 1000.0
+        elapsed_seconds += chunk_seconds
+        total_runs += chunk_runs
+        remaining = duration - elapsed_seconds
+        if remaining <= 0:
+            break
+        chunk_runs = max(
+            10,
+            min(10000, math.ceil(chunk_runs * remaining / max(chunk_seconds, 1e-6) * 1.1)),
+        )
+    power = sampler.stop(elapsed_seconds)
+    return elapsed_seconds, total_runs, power
 
 
 class SyntheticCNN:
@@ -129,6 +154,8 @@ def run_gpu_benchmarks(
     matrix_size: int,
     batch_size: int,
     warmup: int,
+    power_enabled: bool,
+    power_interval: float,
 ) -> list[dict[str, Any]]:
     import torch
 
@@ -138,15 +165,46 @@ def run_gpu_benchmarks(
         torch.cuda.set_device(index)
         properties = torch.cuda.get_device_properties(index)
         device = f"{index}: {properties.name}"
+        power_reader = make_power_reader(backend, index) if power_enabled else None
         size = matrix_size or _auto_matrix_size(properties.total_memory, profile)
         active_batch = batch_size or _profile_value(profile, 2, 8, 16)
 
+        if power_enabled:
+            results.append(idle_result(backend, device, sample_idle_power(power_reader, power_interval)))
+
         if "compute" in suites:
-            results.extend(_run_matmul(torch, backend, device, size, benchmark_duration, warmup))
+            results.extend(
+                _run_matmul(
+                    torch, backend, device, size, benchmark_duration, warmup, power_reader, power_interval
+                )
+            )
         if "memory" in suites:
-            results.append(_run_memory(torch, backend, device, properties.total_memory, profile, benchmark_duration, warmup))
+            results.append(
+                _run_memory(
+                    torch,
+                    backend,
+                    device,
+                    properties.total_memory,
+                    profile,
+                    benchmark_duration,
+                    warmup,
+                    power_reader,
+                    power_interval,
+                )
+            )
         if "inference" in suites:
-            results.extend(_run_inference(torch, backend, device, active_batch, benchmark_duration, warmup))
+            results.extend(
+                _run_inference(
+                    torch,
+                    backend,
+                    device,
+                    active_batch,
+                    benchmark_duration,
+                    warmup,
+                    power_reader,
+                    power_interval,
+                )
+            )
 
         torch.cuda.empty_cache()
         gc.collect()
@@ -160,6 +218,8 @@ def _run_matmul(
     size: int,
     duration: float,
     warmup: int,
+    power_reader: PowerReader | None,
+    power_interval: float,
 ) -> list[dict[str, Any]]:
     cases = [("fp32", torch.float32, False)]
     if backend == "cuda":
@@ -177,23 +237,25 @@ def _run_matmul(
                     nonlocal output
                     output = torch.mm(left, right)
 
-                elapsed, runs = _time_gpu_operation(torch, operation, duration, warmup)
+                elapsed, runs, power = _time_gpu_operation(
+                    torch, operation, duration, warmup, power_reader, power_interval
+                )
                 operations = 2.0 * size**3 * runs
                 tflops = operations / elapsed / 1e12
-                results.append(
-                    _result(
-                        backend,
-                        device,
-                        "compute",
-                        "dense_matmul",
-                        label,
-                        tflops,
-                        "TFLOP/s",
-                        matrix_size=size,
-                        iterations=runs,
-                        mean_ms=elapsed * 1000.0 / runs,
-                    )
+                result = _result(
+                    backend,
+                    device,
+                    "compute",
+                    "dense_matmul",
+                    label,
+                    tflops,
+                    "TFLOP/s",
+                    matrix_size=size,
+                    iterations=runs,
+                    mean_ms=elapsed * 1000.0 / runs,
                 )
+                add_power_details(result, power)
+                results.append(result)
                 del left, right, output
         except (RuntimeError, TypeError) as exc:
             results.append(_skipped(backend, device, "compute", "dense_matmul", label, exc))
@@ -210,6 +272,8 @@ def _run_memory(
     profile: str,
     duration: float,
     warmup: int,
+    power_reader: PowerReader | None,
+    power_interval: float,
 ) -> dict[str, Any]:
     try:
         cap = _profile_value(profile, 64, 256, 512) * 1024**2
@@ -221,9 +285,11 @@ def _run_memory(
         def operation() -> None:
             destination.copy_(source)
 
-        elapsed, runs = _time_gpu_operation(torch, operation, duration, warmup)
+        elapsed, runs, power = _time_gpu_operation(
+            torch, operation, duration, warmup, power_reader, power_interval
+        )
         transferred = 2.0 * source.numel() * source.element_size() * runs
-        return _result(
+        result = _result(
             backend,
             device,
             "memory",
@@ -235,6 +301,8 @@ def _run_memory(
             iterations=runs,
             mean_ms=elapsed * 1000.0 / runs,
         )
+        add_power_details(result, power)
+        return result
     except RuntimeError as exc:
         return _skipped(backend, device, "memory", "device_copy", "fp32", exc)
 
@@ -246,6 +314,8 @@ def _run_inference(
     batch_size: int,
     duration: float,
     warmup: int,
+    power_reader: PowerReader | None,
+    power_interval: float,
 ) -> list[dict[str, Any]]:
     cases = [("fp32", torch.float32)]
     if backend == "cuda":
@@ -264,23 +334,25 @@ def _run_inference(
                     nonlocal output
                     output = model(inputs)
 
-                elapsed, runs = _time_gpu_operation(torch, operation, duration, warmup)
-                images_per_second = batch_size * runs / elapsed
-                results.append(
-                    _result(
-                        backend,
-                        device,
-                        "inference",
-                        "synthetic_cnn",
-                        label,
-                        images_per_second,
-                        "images/s",
-                        batch_size=batch_size,
-                        iterations=runs,
-                        mean_batch_ms=elapsed * 1000.0 / runs,
-                        mean_image_ms=elapsed * 1000.0 / (runs * batch_size),
-                    )
+                elapsed, runs, power = _time_gpu_operation(
+                    torch, operation, duration, warmup, power_reader, power_interval
                 )
+                images_per_second = batch_size * runs / elapsed
+                result = _result(
+                    backend,
+                    device,
+                    "inference",
+                    "synthetic_cnn",
+                    label,
+                    images_per_second,
+                    "images/s",
+                    batch_size=batch_size,
+                    iterations=runs,
+                    mean_batch_ms=elapsed * 1000.0 / runs,
+                    mean_image_ms=elapsed * 1000.0 / (runs * batch_size),
+                )
+                add_power_details(result, power)
+                results.append(result)
                 del model, inputs, output
         except (RuntimeError, TypeError) as exc:
             results.append(_skipped(backend, device, "inference", "synthetic_cnn", label, exc))
