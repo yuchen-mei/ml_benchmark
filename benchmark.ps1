@@ -7,12 +7,41 @@ $ErrorActionPreference = "Stop"
 $RootDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $VenvDir = if ($env:MLBENCH_VENV) { $env:MLBENCH_VENV } else { Join-Path $RootDir ".venv" }
 $RequestedBackend = "all"
+$RequestedProfile = "standard"
+$RequestedSuite = "all"
+$LLMPreset = "qwen"
+$LLMQuantization = "auto"
+$LLMModel = ""
 for ($Index = 0; $Index -lt $BenchmarkArgs.Count; $Index++) {
     if ($BenchmarkArgs[$Index] -match "^--backend=(.+)$") { $RequestedBackend = $Matches[1] }
+    if ($BenchmarkArgs[$Index] -match "^--profile=(.+)$") { $RequestedProfile = $Matches[1] }
+    if ($BenchmarkArgs[$Index] -match "^--suite=(.+)$") { $RequestedSuite = $Matches[1] }
+    if ($BenchmarkArgs[$Index] -match "^--llm-preset=(.+)$") { $LLMPreset = $Matches[1] }
+    if ($BenchmarkArgs[$Index] -match "^--llm-quantization=(.+)$") { $LLMQuantization = $Matches[1] }
+    if ($BenchmarkArgs[$Index] -match "^--llm-model=(.+)$") { $LLMModel = $Matches[1] }
     if ($BenchmarkArgs[$Index] -eq "--backend" -and $Index + 1 -lt $BenchmarkArgs.Count) {
         $RequestedBackend = $BenchmarkArgs[$Index + 1]
     }
+    if ($BenchmarkArgs[$Index] -eq "--profile" -and $Index + 1 -lt $BenchmarkArgs.Count) {
+        $RequestedProfile = $BenchmarkArgs[$Index + 1]
+    }
+    if ($BenchmarkArgs[$Index] -eq "--suite" -and $Index + 1 -lt $BenchmarkArgs.Count) {
+        $RequestedSuite = $BenchmarkArgs[$Index + 1]
+    }
+    if ($BenchmarkArgs[$Index] -eq "--llm-preset" -and $Index + 1 -lt $BenchmarkArgs.Count) {
+        $LLMPreset = $BenchmarkArgs[$Index + 1]
+    }
+    if ($BenchmarkArgs[$Index] -eq "--llm-quantization" -and $Index + 1 -lt $BenchmarkArgs.Count) {
+        $LLMQuantization = $BenchmarkArgs[$Index + 1]
+    }
+    if ($BenchmarkArgs[$Index] -eq "--llm-model" -and $Index + 1 -lt $BenchmarkArgs.Count) {
+        $LLMModel = $BenchmarkArgs[$Index + 1]
+    }
 }
+$LLMRequested = ($RequestedProfile -eq "llm") -or ($RequestedSuite.Split(",") -contains "llm")
+$LLMNeedsQuantization = $LLMQuantization -in @("4bit", "8bit") -or (
+    $LLMQuantization -eq "auto" -and $LLMPreset -eq "kimi" -and -not $LLMModel
+)
 
 function Test-PythonCode([string]$Python, [string]$Code) {
     & $Python -c $Code *> $null
@@ -95,6 +124,17 @@ if ($env:MLBENCH_NO_INSTALL -ne "1") {
             Write-Host "[mlbench] 从指定索引安装 PyTorch ROCm 发行包"
             & $Python -m pip install torch --index-url $env:MLBENCH_TORCH_INDEX_URL
         }
+    }
+    if ($LLMRequested -and (
+        -not (Test-PythonCode $Python "import transformers") -or
+        -not (Test-PythonCode $Python "import accelerate")
+    )) {
+        Write-Host "[mlbench] 安装端到端 LLM 测试依赖"
+        & $Python -m pip install "transformers>=4.51,<5" "accelerate>=1.0" "safetensors>=0.4"
+    }
+    if ($LLMRequested -and $LLMNeedsQuantization -and -not (Test-PythonCode $Python "import bitsandbytes")) {
+        Write-Host "[mlbench] 安装 Kimi/量化 LLM 测试依赖 bitsandbytes"
+        & $Python -m pip install "bitsandbytes>=0.49"
     }
 }
 

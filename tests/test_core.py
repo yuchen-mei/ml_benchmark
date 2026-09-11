@@ -3,7 +3,14 @@ import unittest
 
 from argparse import Namespace
 
-from mlbench.cli import _device_indices, _parse_suites, _selected_backends, _validate_arguments
+from mlbench.cli import (
+    _device_indices,
+    _parse_suites,
+    _resolve_suites,
+    _selected_backends,
+    _validate_arguments,
+)
+from mlbench.llm import generation_metrics, resolve_llm_configuration, vram_budget_gib
 from mlbench.power import _json_power, _text_power, add_power_details
 from mlbench.report import _display_width, _pad_display, format_results
 from mlbench.stats import percentile
@@ -27,6 +34,13 @@ class SelectionTests(unittest.TestCase):
     def test_suite_list(self):
         self.assertEqual(_parse_suites("compute,memory"), {"compute", "memory"})
 
+    def test_llm_profile_selects_only_llm(self):
+        self.assertEqual(_resolve_suites("llm", "all"), {"llm"})
+
+    def test_llm_cannot_mix_with_synthetic_suites(self):
+        with self.assertRaises(ValueError):
+            _resolve_suites("standard", "compute,llm")
+
     def test_device_selection(self):
         self.assertEqual(_device_indices("0,2", 3), [0, 2])
 
@@ -42,6 +56,49 @@ class SelectionTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             _validate_arguments(arguments, {"compute"})
+
+
+class LLMTests(unittest.TestCase):
+    def test_presets_fit_expected_quantization(self):
+        _, qwen_model, qwen_quantization, qwen_estimate = resolve_llm_configuration(
+            "qwen", None, "auto"
+        )
+        _, kimi_model, kimi_quantization, kimi_estimate = resolve_llm_configuration(
+            "kimi", None, "auto"
+        )
+        self.assertEqual(qwen_model, "Qwen/Qwen3-4B-Instruct-2507")
+        self.assertEqual(qwen_quantization, "none")
+        self.assertLess(qwen_estimate, 22.0)
+        self.assertEqual(kimi_model, "moonshotai/Kimi-VL-A3B-Instruct")
+        self.assertEqual(kimi_quantization, "4bit")
+        self.assertLess(kimi_estimate, 22.0)
+
+        _, _, unquantized_kimi, unquantized_estimate = resolve_llm_configuration(
+            "kimi", None, "none"
+        )
+        self.assertEqual(unquantized_kimi, "none")
+        self.assertGreater(unquantized_estimate, 24.0)
+
+    def test_custom_model_does_not_inherit_unknown_memory_estimate(self):
+        _, model, quantization, estimate = resolve_llm_configuration(
+            "kimi", "/models/custom", "auto"
+        )
+        self.assertEqual(model, "/models/custom")
+        self.assertEqual(quantization, "none")
+        self.assertIsNone(estimate)
+
+    def test_vram_budget_honors_free_memory_limit_and_reserve(self):
+        self.assertEqual(vram_budget_gib(24.0, 23.5), 21.5)
+        self.assertEqual(vram_budget_gib(48.0, 47.0), 22.0)
+        self.assertEqual(vram_budget_gib(16.0, 15.0), 13.0)
+
+    def test_generation_metrics_separate_prefill_and_decode(self):
+        metrics = generation_metrics([0.1, 0.2], [1.0, 1.2], [20, 20], 10, 1)
+        self.assertAlmostEqual(metrics["ttft_p50_ms"], 150.0)
+        self.assertAlmostEqual(metrics["prefill_tokens_per_second"], 20.0 / 0.3)
+        self.assertAlmostEqual(metrics["decode_tokens_per_second"], 38.0 / 1.9)
+        self.assertAlmostEqual(metrics["output_tokens_per_second"], 40.0 / 2.2)
+        self.assertAlmostEqual(metrics["e2e_p50_seconds"], 1.1)
 
 
 class PowerTests(unittest.TestCase):

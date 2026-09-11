@@ -50,6 +50,33 @@ requested_backend() {
   printf 'all\n'
 }
 
+requested_option() {
+  local option="$1"
+  local default="$2"
+  shift 2
+  local previous=""
+  local argument
+  for argument in "$@"; do
+    if [[ "${previous}" == "${option}" ]]; then
+      printf '%s\n' "${argument}"
+      return
+    fi
+    if [[ "${argument}" == "${option}="* ]]; then
+      printf '%s\n' "${argument#*=}"
+      return
+    fi
+    previous="${argument}"
+  done
+  printf '%s\n' "${default}"
+}
+
+llm_requested() {
+  local profile suite
+  profile="$(requested_option --profile standard "$@")"
+  suite="$(requested_option --suite all "$@")"
+  [[ "${profile}" == "llm" || ",${suite}," == *",llm,"* ]]
+}
+
 pick_python() {
   if [[ -n "${MLBENCH_PYTHON:-}" ]]; then
     printf '%s\n' "${MLBENCH_PYTHON}"
@@ -130,6 +157,9 @@ PYTHON_BIN="$(pick_python)" || {
   exit 2
 }
 REQUESTED_BACKEND="$(requested_backend "$@")"
+LLM_PRESET="$(requested_option --llm-preset qwen "$@")"
+LLM_QUANTIZATION="$(requested_option --llm-quantization auto "$@")"
+LLM_MODEL="$(requested_option --llm-model "" "$@")"
 
 if ! has_accelerator_runtime "${PYTHON_BIN}" && [[ "${PYTHON_BIN}" != "${VENV_DIR}/bin/python" ]]; then
   PYTHON_VERSION="$(${PYTHON_BIN} -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
@@ -184,6 +214,23 @@ EOF
 当前尝试: ${TORCH_INDEX}
 EOF
         exit 2
+      fi
+    fi
+  fi
+
+  if llm_requested "$@"; then
+    if ! has_module "${PYTHON_BIN}" transformers || ! has_module "${PYTHON_BIN}" accelerate; then
+      log "安装端到端 LLM 测试依赖"
+      "${PYTHON_BIN}" -m pip install "transformers>=4.51,<5" "accelerate>=1.0" "safetensors>=0.4"
+    fi
+    if [[ "${LLM_QUANTIZATION}" == "4bit" || "${LLM_QUANTIZATION}" == "8bit" || \
+          ( "${LLM_QUANTIZATION}" == "auto" && "${LLM_PRESET}" == "kimi" && -z "${LLM_MODEL}" ) ]]; then
+      if ! has_module "${PYTHON_BIN}" bitsandbytes; then
+        log "安装 Kimi/量化 LLM 测试依赖 bitsandbytes"
+        if ! "${PYTHON_BIN}" -m pip install "bitsandbytes>=0.49"; then
+          printf '错误: bitsandbytes 安装失败，请确认当前 CUDA/ROCm GPU 在其支持范围内。\n' >&2
+          exit 2
+        fi
       fi
     fi
   fi

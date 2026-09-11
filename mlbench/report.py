@@ -154,10 +154,28 @@ def _markdown(payload: dict[str, Any]) -> str:
         f"- System: `{system['platform']}`",
         f"- Python: `{system['python']}`",
         f"- Backends: `{', '.join(payload['environment']['available_backends'])}`",
-        "",
-        "| Backend | Device | Suite | Test | Precision | Result | Avg Power | Peak Power | Energy | Efficiency |",
-        "|---|---|---|---|---|---:|---:|---:|---:|---:|",
     ]
+    llm_result = next((item for item in payload["results"] if item["suite"] == "llm"), None)
+    if llm_result is not None:
+        details = llm_result.get("details", {})
+        lines.extend(
+            [
+                f"- LLM: `{details.get('model', 'unknown')}` (`{llm_result['precision']}`)",
+                f"- Workload: `{details.get('prompt_tokens_per_request')} input + "
+                f"{details.get('new_tokens_per_request')} output tokens`, "
+                f"batch `{details.get('batch_size')}`, runs `{details.get('runs')}`",
+                f"- VRAM: model `{details.get('model_vram_gib', 0):.2f} GiB`, "
+                f"peak `{details.get('peak_vram_gib', 0):.2f} GiB`, "
+                f"budget `{details.get('vram_budget_gib', 0):.2f} GiB`",
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "| Backend | Device | Suite | Test | Precision | Result | Avg Power | Peak Power | Energy | Efficiency |",
+            "|---|---|---|---|---|---:|---:|---:|---:|---:|",
+        ]
+    )
     for item in payload["results"]:
         if item["status"] == "ok":
             result = f"{item['value']:.4f} {item['unit']}"
