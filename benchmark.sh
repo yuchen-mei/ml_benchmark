@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+ulimit -c 0 2>/dev/null || true
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-VENV_DIR="${MLBENCH_VENV:-${ROOT_DIR}/.venv}"
 
 log() {
   printf '[mlbench] %s\n' "$*"
@@ -12,25 +12,40 @@ has_module() {
   "$1" -c "import $2" >/dev/null 2>&1
 }
 
-has_accelerator_runtime() {
-  "$1" -c 'import sys
+has_torch_accelerator() {
+  "$1" -c 'import subprocess, sys
+code = r"""
 try:
-    import torch
-    if torch.cuda.is_available():
-        sys.exit(0)
-except Exception:
+    import resource
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+except (ImportError, OSError, ValueError):
     pass
+import torch
+if not torch.cuda.is_available():
+    raise SystemExit(1)
+value = torch.ones((32, 32), dtype=torch.float16, device="cuda")
+value = torch.mm(value, value)
+float(value.sum().item())
+torch.cuda.synchronize()
+"""
 try:
-    import onnxruntime as ort
-    if "VitisAIExecutionProvider" in ort.get_available_providers():
-        sys.exit(0)
-except Exception:
-    pass
-sys.exit(1)' >/dev/null 2>&1
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=20,
+    )
+except (OSError, subprocess.SubprocessError):
+    raise SystemExit(1)
+raise SystemExit(0 if completed.returncode == 0 else 1)' >/dev/null 2>&1
 }
 
 has_vitis_runtime() {
   "$1" -c 'import onnxruntime as ort, sys; sys.exit(0 if "VitisAIExecutionProvider" in ort.get_available_providers() else 1)' >/dev/null 2>&1
+}
+
+has_accelerator_runtime() {
+  has_torch_accelerator "$1" || has_vitis_runtime "$1"
 }
 
 requested_backend() {
@@ -115,6 +130,23 @@ detect_rocm_version() {
   printf '%s\n' "${version}"
 }
 
+detect_amd_gpu_arch() {
+  local architecture=""
+  local device_file device_id
+  for device_file in /sys/class/drm/card[0-9]*/device/device; do
+    [[ -r "${device_file}" ]] || continue
+    device_id="$(<"${device_file}")"
+    case "${device_id,,}" in
+      0x1586) architecture="gfx1151" ;;
+    esac
+    [[ -n "${architecture}" ]] && break
+  done
+  if [[ -z "${architecture}" ]] && command -v rocminfo >/dev/null 2>&1; then
+    architecture="$(rocminfo 2>/dev/null | grep -Eo 'gfx[0-9a-z]+(:[0-9a-z:+-]+)?' | head -1 || true)"
+  fi
+  printf '%s\n' "${architecture%%:*}"
+}
+
 detect_cuda_index() {
   if [[ -n "${MLBENCH_TORCH_INDEX_URL:-}" ]]; then
     printf '%s\n' "${MLBENCH_TORCH_INDEX_URL}"
@@ -142,6 +174,27 @@ detect_cuda_index() {
   fi
   printf 'https://download.pytorch.org/whl/%s\n' "${tag}"
 }
+
+AMD_GPU_ARCH="$(detect_amd_gpu_arch)"
+if [[ -n "${MLBENCH_VENV:-}" ]]; then
+  VENV_DIR="${MLBENCH_VENV}"
+elif [[ "${AMD_GPU_ARCH}" == "gfx1151" ]]; then
+  VENV_DIR="${ROOT_DIR}/.venv-${AMD_GPU_ARCH}"
+else
+  VENV_DIR="${ROOT_DIR}/.venv"
+fi
+
+if [[ "${AMD_GPU_ARCH}" == "gfx1151" ]]; then
+  export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL="${TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL:-1}"
+  if [[ -n "${HSA_OVERRIDE_GFX_VERSION:-}" ]]; then
+    log "gfx1151 架构专用 wheel 不需要 HSA_OVERRIDE_GFX_VERSION，已为本次测试移除"
+    unset HSA_OVERRIDE_GFX_VERSION
+  fi
+  if [[ "${PYTORCH_HIP_ALLOC_CONF:-}" == *"backend:malloc"* ]]; then
+    log "${AMD_GPU_ARCH} 不兼容 backend:malloc，已为本次测试移除该配置"
+    unset PYTORCH_HIP_ALLOC_CONF
+  fi
+fi
 
 if [[ "${1:-}" == "doctor" ]]; then
   PYTHON_BIN="$(pick_python)" || {
@@ -183,7 +236,12 @@ if [[ "${MLBENCH_NO_INSTALL:-0}" != "1" ]]; then
     "${PYTHON_BIN}" -m pip install "onnx>=1.13"
   fi
 
-  if [[ "${REQUESTED_BACKEND}" != "cpu" && "${REQUESTED_BACKEND}" != "npu" ]] && ! has_module "${PYTHON_BIN}" torch; then
+  if [[ "${REQUESTED_BACKEND}" != "cpu" && "${REQUESTED_BACKEND}" != "npu" ]] && ! has_torch_accelerator "${PYTHON_BIN}"; then
+    TORCH_INSTALL_ARGS=(install --upgrade)
+    if has_module "${PYTHON_BIN}" torch; then
+      log "当前 PyTorch 可枚举 GPU，但真实张量探针失败；将重装匹配的发行包"
+      TORCH_INSTALL_ARGS+=(--force-reinstall)
+    fi
     if [[ "${REQUESTED_BACKEND}" != "rocm" ]] && command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
       CUDA_INDEX="$(detect_cuda_index || true)"
       if [[ -z "${CUDA_INDEX}" ]]; then
@@ -191,11 +249,13 @@ if [[ "${MLBENCH_NO_INSTALL:-0}" != "1" ]]; then
         exit 2
       fi
       log "检测到 NVIDIA GPU，从 ${CUDA_INDEX} 安装兼容的 PyTorch CUDA 发行包"
-      "${PYTHON_BIN}" -m pip install torch --index-url "${CUDA_INDEX}"
+      "${PYTHON_BIN}" -m pip "${TORCH_INSTALL_ARGS[@]}" torch --index-url "${CUDA_INDEX}"
     elif [[ "${REQUESTED_BACKEND}" != "cuda" ]] && { command -v rocminfo >/dev/null 2>&1 || [[ -e /dev/kfd ]]; }; then
       ROCM_VERSION="$(detect_rocm_version)"
       TORCH_INDEX="${MLBENCH_TORCH_INDEX_URL:-}"
-      if [[ -z "${TORCH_INDEX}" && -n "${ROCM_VERSION}" ]]; then
+      if [[ -z "${TORCH_INDEX}" && "${AMD_GPU_ARCH}" == "gfx1151" ]]; then
+        TORCH_INDEX="https://rocm.nightlies.amd.com/v2/gfx1151/"
+      elif [[ -z "${TORCH_INDEX}" && -n "${ROCM_VERSION}" ]]; then
         TORCH_INDEX="https://download.pytorch.org/whl/rocm${ROCM_VERSION}"
       fi
       if [[ -z "${TORCH_INDEX}" ]]; then
@@ -206,8 +266,12 @@ if [[ "${MLBENCH_NO_INSTALL:-0}" != "1" ]]; then
 EOF
         exit 2
       fi
-      log "检测到 AMD GPU，从 ${TORCH_INDEX} 安装 PyTorch ROCm 发行包"
-      if ! "${PYTHON_BIN}" -m pip install torch --index-url "${TORCH_INDEX}"; then
+      if [[ "${AMD_GPU_ARCH}" == "gfx1151" ]]; then
+        log "检测到 Strix Halo gfx1151，从架构专用索引安装 PyTorch ROCm"
+      else
+        log "检测到 AMD GPU，从 ${TORCH_INDEX} 安装 PyTorch ROCm 发行包"
+      fi
+      if ! "${PYTHON_BIN}" -m pip "${TORCH_INSTALL_ARGS[@]}" torch --index-url "${TORCH_INDEX}"; then
         cat >&2 <<EOF
 错误: 没有找到与本机 Python/ROCm 匹配的 PyTorch wheel。
 请查阅官方兼容矩阵，并通过 MLBENCH_TORCH_INDEX_URL 指定正确索引。
@@ -234,6 +298,18 @@ EOF
       fi
     fi
   fi
+fi
+
+if [[ "${REQUESTED_BACKEND}" != "cpu" && "${REQUESTED_BACKEND}" != "npu" ]] && \
+   { command -v nvidia-smi >/dev/null 2>&1 || command -v rocminfo >/dev/null 2>&1 || [[ -e /dev/kfd ]]; } && \
+   ! has_torch_accelerator "${PYTHON_BIN}"; then
+  cat >&2 <<EOF
+错误: PyTorch 能检测到加速器，但真实张量分配/矩阵乘探针失败，已安全停止。
+GPU 架构: ${AMD_GPU_ARCH:-unknown}
+Python: $(${PYTHON_BIN} --version 2>&1)
+请使用匹配该 GPU 架构的 AMD/PyTorch wheel，或设置 MLBENCH_TORCH_INDEX_URL 后重试。
+EOF
+  exit 2
 fi
 
 export PYTHONPATH="${ROOT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"

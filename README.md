@@ -17,7 +17,7 @@ Windows PowerShell：
 .\benchmark.ps1
 ```
 
-默认使用 `standard` 档位并以 100 ms 间隔采样功耗，结果写入 `results/mlbench_*.json` 和 `results/mlbench_*.md`。第一次运行可能创建 `.venv` 并安装 NumPy/PyTorch；只有选择 `llm` 档位时才会按需安装 Transformers/Accelerate。驱动和 ROCm/Ryzen AI 系统运行时不会被脚本擅自修改。
+默认使用 `standard` 档位并以 100 ms 间隔采样功耗，结果写入 `results/mlbench_*.json` 和 `results/mlbench_*.md`。第一次运行可能创建 `.venv` 并安装 NumPy/PyTorch；Strix Halo 使用独立的 `.venv-gfx1151`，只有选择 `llm` 档位时才会按需安装 Transformers/Accelerate。驱动和 ROCm/Ryzen AI 系统运行时不会被脚本擅自修改。
 
 终端结果按设备分组，并按照 Unicode 实际显示宽度对齐中文表头；终端宽度不足时自动切换为逐项纵向布局，避免换行破坏列结构。
 
@@ -38,7 +38,7 @@ Windows PowerShell：
 | 硬件 | 执行后端 | 默认项目 |
 |---|---|---|
 | NVIDIA GPU | PyTorch CUDA + `nvidia-smi` | FP32/TF32/FP16/BF16 GEMM、显存拷贝、CNN 推理、功耗 |
-| AMD GPU | PyTorch HIP/ROCm + `amd-smi`/`rocm-smi` | FP32/FP16/BF16 GEMM、显存拷贝、CNN 推理、功耗 |
+| AMD GPU | PyTorch HIP/ROCm + `amd-smi`/`rocm-smi` | FP32/FP16/BF16 GEMM、显存拷贝、CNN/兼容 MLP 推理、功耗 |
 | NVIDIA / AMD GPU | Transformers `generate()` | Llama、Qwen、DeepSeek、Kimi 真实权重端到端生成、TTFT、prefill/decode 吞吐、峰值显存、功耗 |
 | AMD Ryzen AI NPU | ONNX Runtime VitisAI EP + `xrt-smi` | 静态 CNN 吞吐、P50/P95 延迟、首次编译时间、可用时的功耗 |
 | CPU 回退 | NumPy | FP32 GEMM、内存拷贝 |
@@ -134,6 +134,23 @@ MLBENCH_TORCH_INDEX_URL=https://download.pytorch.org/whl/rocmX.Y \
 
 AMD 对部分 Radeon/Ryzen 平台提供独立 wheel；此时建议先按 AMD 文档装好 `torch`，再运行本工具。
 
+#### Ryzen AI Max / Strix Halo (`gfx1151`)
+
+通用 PyTorch ROCm wheel 可能做到 `torch.cuda.is_available() == True`，却在第一次显存分配时原生 `SIGSEGV`。启动器现在会执行真实 FP16 分配与矩阵乘探针，而不是只检查枚举结果；检测到 `gfx1151` 时会隔离旧 `.venv`，自动使用 `.venv-gfx1151` 和架构专用 TheRock wheel 索引，并移除不再需要的 `HSA_OVERRIDE_GFX_VERSION` 兼容伪装：
+
+```bash
+./benchmark.sh --backend rocm
+```
+
+所有合成 GPU 测试也在子进程中运行。即使驱动、MIOpen 或 PyTorch 再次原生崩溃，主程序仍会生成带诊断信息的报告并以状态码 3 退出，而不会出现整个 `benchmark.sh` core dump。由于 `gfx1151` 的 MIOpen Conv2d 仍存在版本相关崩溃，推理项会明确改名为 `synthetic_mlp`；其他 AMD GPU 继续运行 `synthetic_cnn`。
+
+AMD 当前生产支持矩阵验证的是 Ubuntu 24.04、Python 3.12、PyTorch 2.9.1 与 ROCm 7.2.1。Arch Linux 属于尽力支持；如需固定其他架构专用索引，可覆盖：
+
+```bash
+MLBENCH_TORCH_INDEX_URL=https://rocm.nightlies.amd.com/v2/gfx1151/ \
+  ./benchmark.sh --backend rocm
+```
+
 ### AMD Ryzen AI NPU
 
 NPU 需要 AMD 提供的 NPU 驱动、XRT 和 Ryzen AI 软件包。Linux 下先激活 Ryzen AI 安装器创建的 Python 环境并加载 XRT，然后运行：
@@ -199,6 +216,7 @@ PYTHONPATH=. python -m mlbench run --backend cpu --profile quick
 - `dense_matmul`：按 `2 × M × N × K` 计算实测 TFLOP/s，反映大矩阵乘法吞吐。
 - `device_copy`：一次拷贝按一次读取加一次写入计算 GB/s，不等同于厂商标称显存带宽。
 - `synthetic_cnn`：固定 224×224 输入的四层卷积网络端到端吞吐，单位 images/s。
+- `synthetic_mlp`：`gfx1151` 的无卷积兼容推理负载，单位 samples/s；不可与 `synthetic_cnn` 横向比较。
 - `synthetic_cnn_latency`：NPU 同步推理 P50；P95 和均值写在 JSON 的 `details` 中。
 - `llm_ttft_p50`：首 token P50 时间，包含输入搬运、一次 `generate()` 和首 token 解码；P95/均值写在 `details`。
 - `llm_prefill`：以输入 token 数除以 TTFT 得到的 prefill 吞吐估计。
@@ -225,6 +243,8 @@ PYTHONPATH=. python -m mlbench run --backend cpu --profile quick
 - [PyTorch 安装选择器](https://pytorch.org/get-started/locally/)
 - [PyTorch HIP/ROCm 语义](https://docs.pytorch.org/docs/stable/notes/hip.html)
 - [AMD ROCm PyTorch 安装](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/install/installrad/native_linux/install-pytorch.html)
+- [AMD Ryzen APU Linux 支持矩阵](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/compatibility/compatibilityryz/native_linux/native_linux_compatibility.html)
+- [TheRock `gfx1151` 架构专用 wheel](https://github.com/ROCm/TheRock/blob/main/docs/packaging/legacy_per_family_releases.md)
 - [Ryzen AI Linux 安装](https://ryzenai.docs.amd.com/en/latest/linux.html)
 - [Ryzen AI VitisAI EP 模型运行](https://ryzenai.docs.amd.com/en/latest/modelrun.html)
 - [NVIDIA SMI 查询字段](https://docs.nvidia.com/deploy/nvidia-smi/index.html)

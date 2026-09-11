@@ -145,6 +145,23 @@ class SyntheticCNN:
         )
 
 
+class SyntheticMLP:
+    def __new__(cls, torch: Any) -> Any:
+        nn = torch.nn
+        return nn.Sequential(
+            nn.Linear(4096, 8192),
+            nn.ReLU(inplace=True),
+            nn.Linear(8192, 4096),
+            nn.ReLU(inplace=True),
+            nn.Linear(4096, 1000),
+        )
+
+
+def _is_gfx1151(backend: str, architecture: str | None) -> bool:
+    normalized = (architecture or "").lower().split(":", 1)[0]
+    return backend == "rocm" and normalized == "gfx1151"
+
+
 def run_gpu_benchmarks(
     backend: str,
     device_indices: list[int],
@@ -156,6 +173,9 @@ def run_gpu_benchmarks(
     warmup: int,
     power_enabled: bool,
     power_interval: float,
+    device_architecture: str | None = None,
+    precisions: set[str] | None = None,
+    include_idle: bool = True,
 ) -> list[dict[str, Any]]:
     import torch
 
@@ -169,13 +189,21 @@ def run_gpu_benchmarks(
         size = matrix_size or _auto_matrix_size(properties.total_memory, profile)
         active_batch = batch_size or _profile_value(profile, 2, 8, 16)
 
-        if power_enabled:
+        if power_enabled and include_idle:
             results.append(idle_result(backend, device, sample_idle_power(power_reader, power_interval)))
 
         if "compute" in suites:
             results.extend(
                 _run_matmul(
-                    torch, backend, device, size, benchmark_duration, warmup, power_reader, power_interval
+                    torch,
+                    backend,
+                    device,
+                    size,
+                    benchmark_duration,
+                    warmup,
+                    power_reader,
+                    power_interval,
+                    precisions,
                 )
             )
         if "memory" in suites:
@@ -203,6 +231,8 @@ def run_gpu_benchmarks(
                     warmup,
                     power_reader,
                     power_interval,
+                    device_architecture,
+                    precisions,
                 )
             )
 
@@ -220,11 +250,14 @@ def _run_matmul(
     warmup: int,
     power_reader: PowerReader | None,
     power_interval: float,
+    precisions: set[str] | None,
 ) -> list[dict[str, Any]]:
     cases = [("fp32", torch.float32, False)]
     if backend == "cuda":
         cases.append(("tf32", torch.float32, True))
     cases.extend([("fp16", torch.float16, False), ("bf16", torch.bfloat16, False)])
+    if precisions is not None:
+        cases = [case for case in cases if case[0] in precisions]
     results = []
     for label, dtype, tf32 in cases:
         try:
@@ -316,18 +349,31 @@ def _run_inference(
     warmup: int,
     power_reader: PowerReader | None,
     power_interval: float,
+    device_architecture: str | None,
+    precisions: set[str] | None,
 ) -> list[dict[str, Any]]:
     cases = [("fp32", torch.float32)]
     if backend == "cuda":
         cases[0] = ("tf32", torch.float32)
     cases.extend([("fp16", torch.float16), ("bf16", torch.bfloat16)])
+    if precisions is not None:
+        cases = [case for case in cases if case[0] in precisions]
     results = []
+    compatibility_fallback = _is_gfx1151(backend, device_architecture)
     for label, dtype in cases:
         try:
             tf32 = label == "tf32"
             with _matmul_mode(torch, backend, tf32), torch.inference_mode():
-                model = SyntheticCNN(torch).eval().to(device="cuda", dtype=dtype)
-                inputs = torch.randn((batch_size, 3, 224, 224), device="cuda", dtype=dtype)
+                if compatibility_fallback:
+                    model = SyntheticMLP(torch).eval().to(device="cuda", dtype=dtype)
+                    inputs = torch.randn((batch_size, 4096), device="cuda", dtype=dtype)
+                    test = "synthetic_mlp"
+                    unit = "samples/s"
+                else:
+                    model = SyntheticCNN(torch).eval().to(device="cuda", dtype=dtype)
+                    inputs = torch.randn((batch_size, 3, 224, 224), device="cuda", dtype=dtype)
+                    test = "synthetic_cnn"
+                    unit = "images/s"
                 output = None
 
                 def operation() -> None:
@@ -337,25 +383,34 @@ def _run_inference(
                 elapsed, runs, power = _time_gpu_operation(
                     torch, operation, duration, warmup, power_reader, power_interval
                 )
-                images_per_second = batch_size * runs / elapsed
+                samples_per_second = batch_size * runs / elapsed
+                timing_details = {
+                    "batch_size": batch_size,
+                    "iterations": runs,
+                    "mean_batch_ms": elapsed * 1000.0 / runs,
+                }
+                timing_key = "mean_sample_ms" if compatibility_fallback else "mean_image_ms"
+                timing_details[timing_key] = elapsed * 1000.0 / (runs * batch_size)
                 result = _result(
                     backend,
                     device,
                     "inference",
-                    "synthetic_cnn",
+                    test,
                     label,
-                    images_per_second,
-                    "images/s",
-                    batch_size=batch_size,
-                    iterations=runs,
-                    mean_batch_ms=elapsed * 1000.0 / runs,
-                    mean_image_ms=elapsed * 1000.0 / (runs * batch_size),
+                    samples_per_second,
+                    unit,
+                    **timing_details,
                 )
+                if compatibility_fallback:
+                    result["details"]["compatibility_fallback"] = (
+                        f"{device_architecture}: 使用 MLP 避开已知 MIOpen Conv2d 原生崩溃"
+                    )
                 add_power_details(result, power)
                 results.append(result)
                 del model, inputs, output
         except (RuntimeError, TypeError) as exc:
-            results.append(_skipped(backend, device, "inference", "synthetic_cnn", label, exc))
+            test = "synthetic_mlp" if compatibility_fallback else "synthetic_cnn"
+            results.append(_skipped(backend, device, "inference", test, label, exc))
         finally:
             torch.cuda.empty_cache()
     return results

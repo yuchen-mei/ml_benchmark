@@ -9,7 +9,8 @@ from typing import Any
 
 from . import __version__
 from .detect import detect_environment, render_doctor
-from .gpu import run_cpu_benchmarks, run_gpu_benchmarks
+from .gpu import run_cpu_benchmarks
+from .isolation import run_gpu_benchmarks_isolated
 from .llm import LLM_PRESETS, resolve_llm_configuration, run_llm_benchmarks
 from .npu import run_npu_benchmarks
 from .report import print_results, save_report
@@ -133,6 +134,23 @@ def _arguments_dict(args: argparse.Namespace) -> dict[str, Any]:
     return {key: value for key, value in vars(args).items() if key not in {"verbose"}}
 
 
+def _gpu_metadata(environment: dict[str, Any]) -> tuple[dict[int, str], dict[int, str]]:
+    labels: dict[int, str] = {}
+    architectures: dict[int, str] = {}
+    devices = environment["runtime"]["torch"].get("devices", [])
+    amd_devices = environment["hardware"].get("amd_gpus", [])
+    for position, device in enumerate(devices):
+        index = int(device["index"])
+        labels[index] = f"{index}: {device['name']}"
+        hardware_architecture = ""
+        if position < len(amd_devices):
+            hardware_architecture = str(amd_devices[position].get("architecture") or "")
+        architecture = hardware_architecture or str(device.get("architecture") or "")
+        if architecture:
+            architectures[index] = architecture
+    return labels, architectures
+
+
 def _validate_arguments(args: argparse.Namespace, suites: set[str]) -> None:
     if args.duration is not None and args.duration <= 0:
         raise ValueError("duration 必须大于 0")
@@ -224,8 +242,9 @@ def _run(args: argparse.Namespace) -> int:
                     )
                 )
             else:
+                labels, architectures = _gpu_metadata(environment)
                 results.extend(
-                    run_gpu_benchmarks(
+                    run_gpu_benchmarks_isolated(
                         backend,
                         indices,
                         suites,
@@ -236,6 +255,8 @@ def _run(args: argparse.Namespace) -> int:
                         args.warmup,
                         not args.no_power,
                         args.power_interval,
+                        labels,
+                        architectures,
                     )
                 )
         elif backend == "npu":
@@ -271,7 +292,7 @@ def _run(args: argparse.Namespace) -> int:
         print_results(results)
         print(f"\nJSON 报告 : {json_path}")
         print(f"Markdown  : {markdown_path}")
-    return 0
+    return 3 if any(item.get("details", {}).get("worker_failure") for item in results) else 0
 
 
 def main(argv: list[str] | None = None) -> int:

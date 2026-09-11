@@ -1,15 +1,22 @@
 import math
+import signal
+import subprocess
 import unittest
+from unittest.mock import patch
 
 from argparse import Namespace
 
 from mlbench.cli import (
     _device_indices,
+    _gpu_metadata,
     _parse_suites,
     _resolve_suites,
     _selected_backends,
     _validate_arguments,
 )
+from mlbench.detect import _torch_runtime
+from mlbench.gpu import _is_gfx1151 as uses_gfx1151_fallback
+from mlbench.isolation import run_gpu_benchmarks_isolated
 from mlbench.llm import generation_metrics, resolve_llm_configuration, vram_budget_gib
 from mlbench.power import _json_power, _text_power, add_power_details
 from mlbench.report import _display_width, _pad_display, format_results
@@ -56,6 +63,60 @@ class SelectionTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             _validate_arguments(arguments, {"compute"})
+
+    def test_gpu_metadata_uses_sysfs_architecture_fallback(self):
+        environment = {
+            "runtime": {"torch": {"devices": [{"index": 0, "name": "AMD Radeon Graphics"}]}},
+            "hardware": {"amd_gpus": [{"device_id": "0x1586", "architecture": "gfx1151"}]},
+        }
+        labels, architectures = _gpu_metadata(environment)
+        self.assertEqual(labels, {0: "0: AMD Radeon Graphics"})
+        self.assertEqual(architectures, {0: "gfx1151"})
+
+
+class NativeCrashTests(unittest.TestCase):
+    def test_doctor_contains_torch_sigsegv(self):
+        partial = (
+            '__MLBENCH_TORCH_PROBE__={"installed":true,"available":false,'
+            '"version":"2.14.0+rocm7.2","hip_build":"7.2","devices":[],'
+            '"probe":{"status":"probing"}}\n'
+        )
+        completed = subprocess.CompletedProcess([], -signal.SIGSEGV, partial, "")
+        with (
+            patch("mlbench.detect.importlib.util.find_spec", return_value=object()),
+            patch("mlbench.detect.subprocess.run", return_value=completed),
+        ):
+            runtime = _torch_runtime()
+        self.assertFalse(runtime["available"])
+        self.assertEqual(runtime["version"], "2.14.0+rocm7.2")
+        self.assertEqual(runtime["probe"]["status"], "failed")
+        self.assertIn("SIGSEGV", runtime["probe"]["reason"])
+
+    def test_gpu_sigsegv_becomes_diagnostic_result(self):
+        completed = subprocess.CompletedProcess([], -signal.SIGSEGV, "", "")
+        with patch("mlbench.isolation.subprocess.run", return_value=completed):
+            results = run_gpu_benchmarks_isolated(
+                "rocm",
+                [0],
+                {"compute"},
+                "quick",
+                None,
+                0,
+                0,
+                0,
+                False,
+                0.1,
+                {0: "0: AMD Radeon Graphics"},
+                {0: "gfx1151"},
+            )
+        self.assertEqual(len(results), 3)
+        self.assertTrue(all(item["details"]["worker_failure"] for item in results))
+        self.assertTrue(all("SIGSEGV" in item["details"]["reason"] for item in results))
+        self.assertTrue(all("架构专用" in item["details"]["reason"] for item in results))
+
+    def test_gfx1151_uses_safe_inference_fallback(self):
+        self.assertTrue(uses_gfx1151_fallback("rocm", "gfx1151:sramecc+:xnack-"))
+        self.assertFalse(uses_gfx1151_fallback("cuda", "gfx1151"))
 
 
 class LLMTests(unittest.TestCase):
