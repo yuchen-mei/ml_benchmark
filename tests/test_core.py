@@ -5,6 +5,7 @@ from argparse import Namespace
 
 from mlbench.cli import _device_indices, _parse_suites, _selected_backends, _validate_arguments
 from mlbench.power import _json_power, _text_power, add_power_details
+from mlbench.report import _display_width, _pad_display, format_results
 from mlbench.stats import percentile
 
 
@@ -55,6 +56,41 @@ class PowerTests(unittest.TestCase):
         result = {"value": 100.0, "unit": "images/s", "details": {}}
         add_power_details(result, {"status": "ok", "average_w": 20.0})
         self.assertEqual(result["details"]["efficiency"]["value"], 5.0)
+
+
+class ReportTests(unittest.TestCase):
+    @staticmethod
+    def result(precision="fp32"):
+        return {
+            "backend": "cuda",
+            "device": "0: NVIDIA GeForce RTX 4090",
+            "suite": "compute",
+            "test": "dense_matmul",
+            "precision": precision,
+            "value": 46.241,
+            "unit": "TFLOP/s",
+            "status": "ok",
+            "details": {
+                "power": {"average_w": 313.1, "peak_w": 398.8},
+                "efficiency": {"value": 0.148, "unit": "TFLOP/s/W"},
+            },
+        }
+
+    def test_cjk_display_width(self):
+        self.assertEqual(_display_width("平均功耗"), 8)
+        self.assertEqual(_display_width(_pad_display("项目", 10)), 10)
+
+    def test_wide_table_lines_align(self):
+        output = format_results([self.result(), self.result("fp16")], terminal_width=160)
+        table_lines = [line for line in output.splitlines() if line.startswith(("+", "|"))]
+        self.assertEqual(len({_display_width(line) for line in table_lines}), 1)
+        self.assertEqual(output.count("0: NVIDIA GeForce RTX 4090"), 1)
+
+    def test_narrow_terminal_uses_stacked_layout(self):
+        output = format_results([self.result()], terminal_width=60)
+        self.assertNotIn("+---", output)
+        self.assertIn("- dense_matmul [fp32]", output)
+        self.assertIn("功耗: 平均 313.1 W / 峰值 398.8 W", output)
 
 
 if __name__ == "__main__":

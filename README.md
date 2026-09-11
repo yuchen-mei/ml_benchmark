@@ -19,6 +19,8 @@ Windows PowerShell：
 
 默认使用 `standard` 档位并以 100 ms 间隔采样功耗，结果写入 `results/mlbench_*.json` 和 `results/mlbench_*.md`。第一次运行可能创建 `.venv` 并安装 NumPy/PyTorch；驱动和 ROCm/Ryzen AI 系统运行时不会被脚本擅自修改。
 
+终端结果按设备分组，并按照 Unicode 实际显示宽度对齐中文表头；终端宽度不足时自动切换为逐项纵向布局，避免换行破坏列结构。
+
 快速冒烟测试：
 
 ```bash

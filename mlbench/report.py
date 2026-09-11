@@ -1,29 +1,126 @@
 from __future__ import annotations
 
 import json
+import shutil
+import unicodedata
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 
 def print_results(results: list[dict[str, Any]]) -> None:
-    print("\n测试结果")
-    print("=" * 128)
-    print(f"{'后端':<7} {'设备':<28} {'项目':<23} {'精度':<15} {'结果':>18} {'平均功耗':>11} {'能效':>19}")
-    print("-" * 128)
+    terminal_width = shutil.get_terminal_size(fallback=(120, 24)).columns
+    print("\n" + format_results(results, terminal_width))
+
+
+def format_results(results: list[dict[str, Any]], terminal_width: int = 120) -> str:
+    groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for item in results:
-        device = item["device"][:27]
-        if item["status"] == "ok":
-            rendered = f"{item['value']:.3f} {item['unit']}"
+        groups[(item["backend"], item["device"])].append(item)
+
+    lines = ["测试结果"]
+    for (backend, device), items in groups.items():
+        lines.extend(["", f"[{backend}] {device}"])
+        table = _result_table(items)
+        if max((_display_width(line) for line in table), default=0) <= terminal_width:
+            lines.extend(table)
         else:
-            rendered = "跳过"
-        power, efficiency = _power_columns(item)
-        print(
-            f"{item['backend']:<7} {device:<28} {item['test']:<23} "
-            f"{item['precision']:<15} {rendered:>18} {power:>11} {efficiency:>19}"
-        )
+            lines.extend(_stacked_results(items))
+    return "\n".join(lines)
+
+
+def _result_table(results: list[dict[str, Any]]) -> list[str]:
+    headers = ["项目", "精度", "结果", "平均功耗", "峰值功耗", "能效"]
+    alignments = ["left", "left", "right", "right", "right", "right"]
+    maximums = [24, 14, 22, 12, 12, 24]
+    rows = [_result_row(item) for item in results]
+    widths = [
+        min(maximum, max(_display_width(header), *(_display_width(row[index]) for row in rows)))
+        for index, (header, maximum) in enumerate(zip(headers, maximums))
+    ]
+    border = "+" + "+".join("-" * (width + 2) for width in widths) + "+"
+    lines = [border, _table_line(headers, widths, ["left"] * len(headers)), border]
+    lines.extend(_table_line(row, widths, alignments) for row in rows)
+    lines.append(border)
+    for item in results:
         if item["status"] != "ok":
-            print(f"        原因: {item.get('details', {}).get('reason', 'unknown')}")
+            reason = item.get("details", {}).get("reason", "unknown")
+            lines.append(f"! {item['test']} / {item['precision']}: {reason}")
+    return lines
+
+
+def _result_row(item: dict[str, Any]) -> list[str]:
+    power = item.get("details", {}).get("power", {})
+    efficiency = item.get("details", {}).get("efficiency", {})
+    if item["status"] == "ok":
+        result = f"{item['value']:.3f} {item['unit']}"
+    else:
+        result = "跳过"
+    if item.get("unit") == "W":
+        average_power = "-"
+        peak_power = "-"
+    else:
+        average_power = _format_optional(power.get("average_w"), "W", 1)
+        peak_power = _format_optional(power.get("peak_w"), "W", 1)
+    efficiency_text = _format_optional(efficiency.get("value"), efficiency.get("unit", ""), 3)
+    return [item["test"], item["precision"], result, average_power, peak_power, efficiency_text]
+
+
+def _table_line(values: list[str], widths: list[int], alignments: list[str]) -> str:
+    cells = [
+        _pad_display(value, width, alignment)
+        for value, width, alignment in zip(values, widths, alignments)
+    ]
+    return "| " + " | ".join(cells) + " |"
+
+
+def _stacked_results(results: list[dict[str, Any]]) -> list[str]:
+    lines = []
+    for item in results:
+        test, precision, result, average_power, peak_power, efficiency = _result_row(item)
+        lines.append(f"- {test} [{precision}]")
+        lines.append(f"  结果: {result}")
+        if average_power != "-" or peak_power != "-":
+            lines.append(f"  功耗: 平均 {average_power} / 峰值 {peak_power}")
+        if efficiency != "-":
+            lines.append(f"  能效: {efficiency}")
+        if item["status"] != "ok":
+            lines.append(f"  原因: {item.get('details', {}).get('reason', 'unknown')}")
+    return lines
+
+
+def _display_width(value: str) -> int:
+    width = 0
+    for character in str(value):
+        if unicodedata.combining(character) or unicodedata.category(character) in {"Cf", "Cc"}:
+            continue
+        width += 2 if unicodedata.east_asian_width(character) in {"W", "F"} else 1
+    return width
+
+
+def _truncate_display(value: str, width: int) -> str:
+    value = str(value)
+    if _display_width(value) <= width:
+        return value
+    if width <= 3:
+        return "." * width
+    available = width - 3
+    output = []
+    used = 0
+    for character in value:
+        character_width = _display_width(character)
+        if used + character_width > available:
+            break
+        output.append(character)
+        used += character_width
+    return "".join(output) + "..."
+
+
+def _pad_display(value: str, width: int, alignment: str = "left") -> str:
+    value = _truncate_display(str(value), width)
+    padding = " " * max(0, width - _display_width(value))
+    return padding + value if alignment == "right" else value + padding
 
 
 def save_report(
@@ -90,17 +187,6 @@ def _markdown(payload: dict[str, Any]) -> str:
         ]
     )
     return "\n".join(lines)
-
-
-def _power_columns(item: dict[str, Any]) -> tuple[str, str]:
-    if item.get("unit") == "W":
-        return "-", "-"
-    details = item.get("details", {})
-    power = details.get("power", {})
-    efficiency = details.get("efficiency", {})
-    power_text = _format_optional(power.get("average_w"), "W", 1)
-    efficiency_text = _format_optional(efficiency.get("value"), efficiency.get("unit", ""), 3)
-    return power_text, efficiency_text
 
 
 def _format_optional(value: Any, unit: str, digits: int = 2) -> str:
