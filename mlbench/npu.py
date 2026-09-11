@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -10,74 +12,81 @@ from .power import PowerSampler, add_power_details, idle_result, make_power_read
 from .stats import mean, percentile
 
 
-def _make_model(path: Path, batch_size: int) -> None:
-    try:
-        import onnx
-        from onnx import TensorProto, helper, numpy_helper
-    except ImportError as exc:
-        raise RuntimeError("生成 NPU 测试模型需要 onnx 包；请在 Ryzen AI 环境中安装 onnx") from exc
+_ORT_DTYPES = {
+    "tensor(bool)": "bool",
+    "tensor(double)": "float64",
+    "tensor(float)": "float32",
+    "tensor(float16)": "float16",
+    "tensor(int8)": "int8",
+    "tensor(int16)": "int16",
+    "tensor(int32)": "int32",
+    "tensor(int64)": "int64",
+    "tensor(uint8)": "uint8",
+    "tensor(uint16)": "uint16",
+    "tensor(uint32)": "uint32",
+    "tensor(uint64)": "uint64",
+}
 
+
+def _quicktest_model(model_file: str | None) -> tuple[Path, str]:
+    if model_file:
+        path = Path(model_file).expanduser().resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"NPU 模型不存在: {path}")
+        return path, "custom"
+    roots = []
+    installation_path = os.environ.get("RYZEN_AI_INSTALLATION_PATH")
+    if installation_path:
+        roots.append(Path(installation_path).expanduser() / "quicktest")
+    roots.append(Path(sys.prefix) / "quicktest")
+    for root in _unique_paths(roots):
+        if not root.is_dir():
+            continue
+        candidates = sorted(root.glob("*.onnx")) or sorted(root.rglob("*.onnx"))
+        if candidates:
+            return candidates[0].resolve(), "ryzen_ai_quicktest"
+    searched = ", ".join(str(root) for root in _unique_paths(roots))
+    raise FileNotFoundError(
+        "未找到 Ryzen AI 安装包自带的 quicktest ONNX 模型；"
+        f"已搜索: {searched}。可用 --npu-model 显式指定。"
+    )
+
+
+def _unique_paths(paths: list[Path]) -> list[Path]:
+    unique = []
+    for path in paths:
+        if path not in unique:
+            unique.append(path)
+    return unique
+
+
+def _make_feed(inputs: list[Any], requested_batch: int, rng: Any) -> tuple[dict[str, Any], int]:
     import numpy as np
 
-    rng = np.random.default_rng(2026)
-    nodes = []
-    initializers = []
-    channels = [3, 64, 128, 256, 256]
-    current = "input"
-    for layer, (input_channels, output_channels) in enumerate(zip(channels, channels[1:]), start=1):
-        weight_name = f"conv{layer}_weight"
-        bias_name = f"conv{layer}_bias"
-        conv_output = f"conv{layer}_output"
-        relu_output = f"relu{layer}_output"
-        weights = rng.standard_normal((output_channels, input_channels, 3, 3), dtype=np.float32) * 0.02
-        bias = np.zeros((output_channels,), dtype=np.float32)
-        initializers.extend(
-            [numpy_helper.from_array(weights, weight_name), numpy_helper.from_array(bias, bias_name)]
-        )
-        nodes.append(
-            helper.make_node(
-                "Conv",
-                [current, weight_name, bias_name],
-                [conv_output],
-                kernel_shape=[3, 3],
-                pads=[1, 1, 1, 1],
-                strides=[2, 2],
-            )
-        )
-        nodes.append(helper.make_node("Relu", [conv_output], [relu_output]))
-        current = relu_output
-
-    linear_weight = rng.standard_normal((256, 1000), dtype=np.float32) * 0.02
-    linear_bias = np.zeros((1000,), dtype=np.float32)
-    initializers.extend(
-        [
-            numpy_helper.from_array(linear_weight, "linear_weight"),
-            numpy_helper.from_array(linear_bias, "linear_bias"),
-        ]
-    )
-    nodes.extend(
-        [
-            helper.make_node("GlobalAveragePool", [current], ["pool_output"]),
-            helper.make_node("Flatten", ["pool_output"], ["flat_output"], axis=1),
-            helper.make_node("Gemm", ["flat_output", "linear_weight", "linear_bias"], ["output"]),
-        ]
-    )
-    graph = helper.make_graph(
-        nodes,
-        "mlbench_synthetic_cnn",
-        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [batch_size, 3, 224, 224])],
-        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [batch_size, 1000])],
-        initializer=initializers,
-    )
-    model = helper.make_model(
-        graph,
-        producer_name="hetero-mlbench",
-        opset_imports=[helper.make_opsetid("", 17)],
-    )
-    model.ir_version = min(model.ir_version, 9)
-    onnx.checker.check_model(model)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    onnx.save(model, path)
+    feed = {}
+    effective_batch = None
+    for metadata in inputs:
+        dtype_name = _ORT_DTYPES.get(metadata.type)
+        if dtype_name is None:
+            raise RuntimeError(f"NPU quicktest 模型含不支持的输入类型: {metadata.name}={metadata.type}")
+        shape = []
+        for index, dimension in enumerate(metadata.shape):
+            if isinstance(dimension, int) and dimension > 0:
+                value = dimension
+            else:
+                value = requested_batch if index == 0 else 1
+            shape.append(value)
+        if shape and effective_batch is None:
+            effective_batch = shape[0]
+        dtype = np.dtype(dtype_name)
+        if np.issubdtype(dtype, np.floating):
+            value = rng.standard_normal(shape).astype(dtype)
+        elif np.issubdtype(dtype, np.bool_):
+            value = rng.integers(0, 2, size=shape).astype(dtype)
+        else:
+            value = rng.integers(0, 2, size=shape, dtype=dtype)
+        feed[metadata.name] = value
+    return feed, effective_batch or requested_batch
 
 
 def run_npu_benchmarks(
@@ -88,6 +97,7 @@ def run_npu_benchmarks(
     warmup: int,
     streams: int,
     config_file: str | None,
+    model_file: str | None,
     power_enabled: bool,
     power_interval: float,
 ) -> list[dict[str, Any]]:
@@ -103,23 +113,25 @@ def run_npu_benchmarks(
         "standard": 3.0,
         "extended": 10.0,
     }[profile]
-    model_path = output_dir / "models" / f"synthetic_cnn_b{active_batch}.onnx"
-    if not model_path.exists():
-        _make_model(model_path, active_batch)
+    model_path, model_source = _quicktest_model(model_file)
 
     provider_options = {
         "cache_dir": str(output_dir / "cache"),
-        "cache_key": f"mlbench_synthetic_cnn_b{active_batch}",
+        "cache_key": f"mlbench_{model_path.stem}_b{active_batch}",
     }
     if config_file:
         config_path = Path(config_file).expanduser().resolve()
         if not config_path.is_file():
             raise FileNotFoundError(f"NPU 配置文件不存在: {config_path}")
         provider_options["config_file"] = str(config_path)
-    os.makedirs(provider_options["cache_dir"], exist_ok=True)
+    Path(provider_options["cache_dir"]).mkdir(parents=True, exist_ok=True)
 
     session_options = ort.SessionOptions()
     session_options.log_severity_level = 3
+    profile_dir = output_dir / "profiles"
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    session_options.enable_profiling = True
+    session_options.profile_file_prefix = str(profile_dir / "npu_profile")
     compile_started = time.perf_counter()
     session = ort.InferenceSession(
         str(model_path),
@@ -132,8 +144,7 @@ def run_npu_benchmarks(
         raise RuntimeError(f"VitisAI EP 未成为首选执行后端: {session.get_providers()}")
 
     rng = np.random.default_rng(9)
-    inputs = rng.standard_normal((active_batch, 3, 224, 224), dtype=np.float32)
-    feed = {session.get_inputs()[0].name: inputs}
+    feed, active_batch = _make_feed(session.get_inputs(), active_batch, rng)
     for _ in range(warmup):
         session.run(None, feed)
 
@@ -162,6 +173,13 @@ def run_npu_benchmarks(
             latencies.extend(future.result())
     elapsed = time.perf_counter() - started
     power = sampler.stop(elapsed)
+    profile_path = Path(session.end_profiling())
+    provider_counts = _profile_provider_counts(profile_path)
+    if provider_counts.get("VitisAIExecutionProvider", 0) < 1:
+        raise RuntimeError(
+            "VitisAIExecutionProvider 已注册，但没有任何模型节点实际卸载到 NPU；"
+            f"profile={profile_path}, providers={provider_counts}"
+        )
     iterations = len(latencies)
     throughput = iterations * active_batch / elapsed
 
@@ -169,8 +187,8 @@ def run_npu_benchmarks(
         "backend": "npu",
         "device": device,
         "suite": "inference",
-        "test": "synthetic_cnn",
-        "precision": "fp32-input/auto",
+        "test": "ryzen_ai_quicktest_cnn",
+        "precision": "int8/auto" if model_source == "ryzen_ai_quicktest" else "model/auto",
         "status": "ok",
         "details": {
             "batch_size": active_batch,
@@ -178,11 +196,19 @@ def run_npu_benchmarks(
             "iterations": iterations,
             "compile_seconds": compile_seconds,
             "providers": session.get_providers(),
+            "profile_provider_counts": provider_counts,
+            "profile": str(profile_path),
             "model": str(model_path),
+            "model_source": model_source,
         },
     }
     throughput_result = dict(common, value=throughput, unit="images/s")
-    latency_result = dict(common, test="synthetic_cnn_latency", value=percentile(latencies, 50), unit="ms")
+    latency_result = dict(
+        common,
+        test="ryzen_ai_quicktest_cnn_latency",
+        value=percentile(latencies, 50),
+        unit="ms",
+    )
     latency_result["details"] = dict(
         common["details"],
         mean_ms=mean(latencies),
@@ -192,3 +218,16 @@ def run_npu_benchmarks(
     add_power_details(latency_result, power)
     results.extend([throughput_result, latency_result])
     return results
+
+
+def _profile_provider_counts(path: Path) -> dict[str, int]:
+    try:
+        events = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"无法读取 ONNX Runtime profiling 结果: {path}: {exc}") from exc
+    counts: dict[str, int] = {}
+    for event in events:
+        provider = event.get("args", {}).get("provider")
+        if provider:
+            counts[provider] = counts.get(provider, 0) + 1
+    return counts

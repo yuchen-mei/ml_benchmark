@@ -12,10 +12,12 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .npu_runtime import npu_subprocess_environment
 from .runtime import process_exit_reason
 
 
 _TORCH_PROBE_PREFIX = "__MLBENCH_TORCH_PROBE__="
+_ORT_PROBE_PREFIX = "__MLBENCH_ORT_PROBE__="
 _TORCH_PROBE_CODE = r'''
 import json
 
@@ -66,6 +68,27 @@ except Exception as exc:
         "status": "failed",
         "reason": f"{type(exc).__name__}: {exc}",
     }
+print(prefix + json.dumps(payload, ensure_ascii=False, separators=(",", ":")), flush=True)
+'''
+_ORT_PROBE_CODE = r'''
+import json
+
+prefix = "__MLBENCH_ORT_PROBE__="
+payload = {"installed": False, "providers": []}
+try:
+    import resource
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+except (ImportError, OSError, ValueError):
+    pass
+try:
+    import onnxruntime as ort
+    payload.update({
+        "installed": True,
+        "version": str(ort.__version__),
+        "providers": list(ort.get_available_providers()),
+    })
+except Exception as exc:
+    payload["error"] = f"{type(exc).__name__}: {exc}"
 print(prefix + json.dumps(payload, ensure_ascii=False, separators=(",", ":")), flush=True)
 '''
 
@@ -240,20 +263,42 @@ def _probe_payload(output: str) -> dict[str, Any] | None:
 
 
 def _ort_runtime() -> dict[str, Any]:
-    info: dict[str, Any] = {"installed": False, "providers": []}
+    executable = os.environ.get("MLBENCH_NPU_PYTHON", sys.executable)
+    fallback: dict[str, Any] = {
+        "installed": False,
+        "providers": [],
+        "executable": executable,
+        "external": os.path.abspath(executable) != os.path.abspath(sys.executable),
+    }
     try:
-        import onnxruntime as ort
-    except Exception as exc:
-        info["error"] = f"{type(exc).__name__}: {exc}"
-        return info
-    info.update(
-        {
-            "installed": True,
-            "version": ort.__version__,
-            "providers": list(ort.get_available_providers()),
-        }
-    )
-    return info
+        completed = subprocess.run(
+            [executable, "-c", _ORT_PROBE_CODE],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=20.0,
+            env=npu_subprocess_environment(executable),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        fallback["error"] = f"ONNX Runtime 探针失败: {type(exc).__name__}: {exc}"
+        return fallback
+    payload = _prefixed_payload(completed.stdout, _ORT_PROBE_PREFIX)
+    if payload is None or completed.returncode != 0:
+        fallback["error"] = f"ONNX Runtime 探针{process_exit_reason(completed.returncode, completed.stderr)}"
+        return fallback
+    payload.update({"executable": executable, "external": fallback["external"]})
+    return payload
+
+
+def _prefixed_payload(output: str, prefix: str) -> dict[str, Any] | None:
+    for line in reversed(output.splitlines()):
+        if line.startswith(prefix):
+            try:
+                payload = json.loads(line[len(prefix) :])
+            except json.JSONDecodeError:
+                return None
+            return payload if isinstance(payload, dict) else None
+    return None
 
 
 def detect_environment() -> dict[str, Any]:
@@ -283,7 +328,7 @@ def detect_environment() -> dict[str, Any]:
         else:
             warnings.append("检测到 AMD GPU，但当前 Python 的 PyTorch ROCm/HIP 不可用。")
     if amd_npu.get("detected") and "npu" not in available:
-        warnings.append("检测到 AMD NPU，但 VitisAIExecutionProvider 不可用。")
+        warnings.extend(_npu_runtime_warnings(system=platform.system(), runtime=ort_info))
 
     return {
         "system": {
@@ -327,10 +372,18 @@ def render_doctor(environment: dict[str, Any]) -> str:
 
 def _runtime_line(runtime: dict[str, Any]) -> str:
     if not runtime.get("installed"):
-        return "未安装"
+        line = "不可用"
+        if runtime.get("external"):
+            line += f"; python={runtime.get('executable')}"
+        if runtime.get("error"):
+            line += f"; error={_shorten(str(runtime['error']), 300)}"
+        return line
     version = runtime.get("version", "unknown")
     if "providers" in runtime:
-        return f"{version}; providers={','.join(runtime['providers'])}"
+        line = f"{version}; providers={','.join(runtime['providers'])}"
+        if runtime.get("external"):
+            line += f"; python={runtime.get('executable')}"
+        return line
     if runtime.get("hip_build"):
         backend = "HIP/ROCm"
     elif runtime.get("cuda_build"):
@@ -346,3 +399,36 @@ def _runtime_line(runtime: dict[str, Any]) -> str:
 
 def _compact_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _npu_runtime_warnings(system: str, runtime: dict[str, Any]) -> list[str]:
+    executable = runtime.get("executable", sys.executable)
+    if runtime.get("installed"):
+        message = (
+            f"检测到 AMD NPU，但 {executable} 中的 ONNX Runtime 不含 "
+            "VitisAIExecutionProvider；PyPI 通用 onnxruntime 不能驱动该 NPU。"
+        )
+    else:
+        message = (
+            "检测到 AMD NPU 内核设备，但未找到 Ryzen AI 用户态运行时。"
+            "安装 AMD Ryzen AI Software 后设置 "
+            "MLBENCH_NPU_PYTHON=/path/to/ryzen-ai-venv/bin/python。"
+        )
+    warnings = [message]
+    if runtime.get("error"):
+        warnings.append(f"Ryzen AI 运行时加载错误：{_shorten(str(runtime['error']), 500)}")
+    if system == "Linux" and not _is_ubuntu_2404():
+        warnings.append("AMD Ryzen AI Linux 发行包当前面向 Ubuntu 24.04；其他发行版不在官方支持范围。")
+    return warnings
+
+
+def _is_ubuntu_2404() -> bool:
+    try:
+        values = {}
+        for line in Path("/etc/os-release").read_text(encoding="utf-8").splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                values[key] = value.strip().strip('"')
+    except OSError:
+        return False
+    return values.get("ID") == "ubuntu" and values.get("VERSION_ID", "").startswith("24.04")

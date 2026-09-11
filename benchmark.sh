@@ -41,11 +41,123 @@ raise SystemExit(0 if completed.returncode == 0 else 1)' >/dev/null 2>&1
 }
 
 has_vitis_runtime() {
-  "$1" -c 'import onnxruntime as ort, sys; sys.exit(0 if "VitisAIExecutionProvider" in ort.get_available_providers() else 1)' >/dev/null 2>&1
+  PYTHONPATH="${ROOT_DIR}${PYTHONPATH:+:${PYTHONPATH}}" "$1" -c 'import subprocess, sys
+from mlbench.npu_runtime import npu_subprocess_environment
+code = r"""
+try:
+    import resource
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+except (ImportError, OSError, ValueError):
+    pass
+import onnxruntime as ort
+raise SystemExit(0 if "VitisAIExecutionProvider" in ort.get_available_providers() else 1)
+"""
+try:
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=20,
+        env=npu_subprocess_environment(sys.executable),
+    )
+except (OSError, subprocess.SubprocessError):
+    raise SystemExit(1)
+raise SystemExit(0 if completed.returncode == 0 else 1)' >/dev/null 2>&1
 }
 
 has_accelerator_runtime() {
   has_torch_accelerator "$1" || has_vitis_runtime "$1"
+}
+
+find_npu_python() {
+  local candidate directory library search_root step
+  local candidates=()
+  local search_roots=()
+  if [[ -n "${MLBENCH_NPU_PYTHON:-}" ]]; then
+    if [[ -x "${MLBENCH_NPU_PYTHON}" ]] && has_vitis_runtime "${MLBENCH_NPU_PYTHON}"; then
+      printf '%s\n' "${MLBENCH_NPU_PYTHON}"
+    fi
+    return
+  fi
+  if [[ -n "${VIRTUAL_ENV:-}" ]]; then
+    candidates+=("${VIRTUAL_ENV}/bin/python")
+  fi
+  if [[ -n "${RYZEN_AI_INSTALLATION_PATH:-}" ]]; then
+    candidates+=(
+      "${RYZEN_AI_INSTALLATION_PATH}/bin/python"
+      "${RYZEN_AI_INSTALLATION_PATH}/venv/bin/python"
+    )
+  fi
+  if command -v python >/dev/null 2>&1; then
+    candidates+=("$(command -v python)")
+  fi
+  candidates+=(
+    "${HOME}"/ryzenai*/venv*/bin/python
+    "${HOME}"/ryzen_ai*/venv*/bin/python
+    "${HOME}"/*[Rr]yzen*/venv*/bin/python
+    "${HOME}"/*[Rr]yzen*/*/venv*/bin/python
+    "${HOME}"/Developer/*[Rr]yzen*/venv*/bin/python
+    "${HOME}"/Developer/*[Rr]yzen*/*/venv*/bin/python
+    /opt/AMD/ryzenai/venv*/bin/python
+    /opt/ryzen-ai/venv*/bin/python
+    /opt/ryzenai/venv*/bin/python
+    /opt/*[Rr]yzen*/venv*/bin/python
+  )
+  for candidate in "${candidates[@]}"; do
+    if [[ -x "${candidate}" ]] && has_vitis_runtime "${candidate}"; then
+      printf '%s\n' "${candidate}"
+      return
+    fi
+  done
+  search_roots+=(
+    "${HOME}"/*[Rr]yzen*
+    "${HOME}"/Developer/*[Rr]yzen*
+    /opt/*[Rr]yzen*
+    /opt/AMD
+  )
+  for search_root in "${search_roots[@]}"; do
+    [[ -d "${search_root}" ]] || continue
+    while IFS= read -r library; do
+      directory="$(dirname -- "${library}")"
+      for ((step = 0; step < 8 && directory != "/"; step++)); do
+        candidate="${directory}/bin/python"
+        if [[ -x "${candidate}" ]] && has_vitis_runtime "${candidate}"; then
+          printf '%s\n' "${candidate}"
+          return
+        fi
+        directory="$(dirname -- "${directory}")"
+      done
+    done < <(find "${search_root}" -maxdepth 9 -type f -name libonnxruntime_vitisai_ep.so 2>/dev/null)
+  done
+}
+
+configure_npu_runtime() {
+  local values
+  values="$(PYTHONPATH="${ROOT_DIR}${PYTHONPATH:+:${PYTHONPATH}}" "$1" -c '
+import json, sys
+from mlbench.npu_runtime import npu_subprocess_environment
+environment = npu_subprocess_environment(sys.executable)
+print(json.dumps({key: environment[key] for key in (
+    "RYZEN_AI_INSTALLATION_PATH", "XILINX_XRT", "PATH", "LD_LIBRARY_PATH"
+)}))
+')"
+  export RYZEN_AI_INSTALLATION_PATH
+  RYZEN_AI_INSTALLATION_PATH="$(printf '%s' "${values}" | "$1" -c 'import json, sys; print(json.load(sys.stdin)["RYZEN_AI_INSTALLATION_PATH"])')"
+  export XILINX_XRT
+  XILINX_XRT="$(printf '%s' "${values}" | "$1" -c 'import json, sys; print(json.load(sys.stdin)["XILINX_XRT"])')"
+  export PATH
+  PATH="$(printf '%s' "${values}" | "$1" -c 'import json, sys; print(json.load(sys.stdin)["PATH"])')"
+  export LD_LIBRARY_PATH
+  LD_LIBRARY_PATH="$(printf '%s' "${values}" | "$1" -c 'import json, sys; print(json.load(sys.stdin)["LD_LIBRARY_PATH"])')"
+}
+
+print_npu_runtime_help() {
+  cat >&2 <<'EOF'
+错误: 检测到 AMD NPU 内核设备，但没有找到包含 VitisAIExecutionProvider 的 Ryzen AI Python 环境。
+普通 PyPI onnxruntime 不包含 AMD NPU EP。请先安装 AMD Ryzen AI Software 1.8（Ubuntu 24.04 / Python 3.12），然后运行：
+  MLBENCH_NPU_PYTHON=/path/to/ryzen-ai-venv/bin/python ./benchmark.sh --backend npu
+Arch Linux 不在 AMD 当前官方 NPU 用户态支持范围；仅有 /dev/accel/accel0 还不足以运行模型。
+EOF
 }
 
 requested_backend() {
@@ -97,7 +209,19 @@ pick_python() {
     printf '%s\n' "${MLBENCH_PYTHON}"
     return
   fi
-  if command -v python >/dev/null 2>&1 && has_accelerator_runtime "$(command -v python)"; then
+  if [[ "${REQUESTED_BACKEND:-all}" == "npu" && -n "${NPU_PYTHON:-}" ]]; then
+    printf '%s\n' "${NPU_PYTHON}"
+    return
+  fi
+  if command -v python >/dev/null 2>&1 && has_torch_accelerator "$(command -v python)"; then
+    command -v python
+    return
+  fi
+  if [[ -x "${VENV_DIR}/bin/python" ]] && has_torch_accelerator "${VENV_DIR}/bin/python"; then
+    printf '%s\n' "${VENV_DIR}/bin/python"
+    return
+  fi
+  if command -v python >/dev/null 2>&1 && has_vitis_runtime "$(command -v python)"; then
     command -v python
     return
   fi
@@ -196,6 +320,16 @@ if [[ "${AMD_GPU_ARCH}" == "gfx1151" ]]; then
   fi
 fi
 
+REQUESTED_BACKEND="$(requested_backend "$@")"
+NPU_PYTHON="$(find_npu_python || true)"
+if [[ -n "${NPU_PYTHON}" ]]; then
+  export MLBENCH_NPU_PYTHON="${NPU_PYTHON}"
+  configure_npu_runtime "${NPU_PYTHON}"
+elif [[ "${REQUESTED_BACKEND}" == "npu" ]]; then
+  print_npu_runtime_help
+  exit 2
+fi
+
 if [[ "${1:-}" == "doctor" ]]; then
   PYTHON_BIN="$(pick_python)" || {
     printf '错误: 未找到可用 Python。\n' >&2
@@ -209,7 +343,6 @@ PYTHON_BIN="$(pick_python)" || {
   printf '错误: 需要 Python 3.10 或更高版本。\n' >&2
   exit 2
 }
-REQUESTED_BACKEND="$(requested_backend "$@")"
 LLM_PRESET="$(requested_option --llm-preset qwen "$@")"
 LLM_QUANTIZATION="$(requested_option --llm-quantization auto "$@")"
 LLM_MODEL="$(requested_option --llm-model "" "$@")"
@@ -229,11 +362,6 @@ if [[ "${MLBENCH_NO_INSTALL:-0}" != "1" ]]; then
   if ! has_module "${PYTHON_BIN}" numpy; then
     log "安装基础依赖 numpy"
     "${PYTHON_BIN}" -m pip install "numpy>=1.23"
-  fi
-
-  if has_vitis_runtime "${PYTHON_BIN}" && ! has_module "${PYTHON_BIN}" onnx; then
-    log "安装 NPU 测试模型生成依赖 onnx"
-    "${PYTHON_BIN}" -m pip install "onnx>=1.13"
   fi
 
   if [[ "${REQUESTED_BACKEND}" != "cpu" && "${REQUESTED_BACKEND}" != "npu" ]] && ! has_torch_accelerator "${PYTHON_BIN}"; then

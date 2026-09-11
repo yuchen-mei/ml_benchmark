@@ -40,10 +40,10 @@ Windows PowerShell：
 | NVIDIA GPU | PyTorch CUDA + `nvidia-smi` | FP32/TF32/FP16/BF16 GEMM、显存拷贝、CNN 推理、功耗 |
 | AMD GPU | PyTorch HIP/ROCm + `amd-smi`/`rocm-smi` | FP32/FP16/BF16 GEMM、显存拷贝、CNN/兼容 MLP 推理、功耗 |
 | NVIDIA / AMD GPU | Transformers `generate()` | Llama、Qwen、DeepSeek、Kimi 真实权重端到端生成、TTFT、prefill/decode 吞吐、峰值显存、功耗 |
-| AMD Ryzen AI NPU | ONNX Runtime VitisAI EP + `xrt-smi` | 静态 CNN 吞吐、P50/P95 延迟、首次编译时间、可用时的功耗 |
+| AMD Ryzen AI NPU | ONNX Runtime VitisAI EP + `xrt-smi` | Ryzen AI quicktest CNN 吞吐、P50/P95 延迟、首次编译时间、可用时的功耗 |
 | CPU 回退 | NumPy | FP32 GEMM、内存拷贝 |
 
-PyTorch 的 ROCm 版本沿用 `torch.cuda` Python API，所以 GPU 基准核心不需要维护两份实现。NPU 使用 ONNX opset 17 的静态合成 CNN，首次运行会由 VitisAI EP 编译并缓存。
+PyTorch 的 ROCm 版本沿用 `torch.cuda` Python API，所以 GPU 基准核心不需要维护两份实现。NPU 默认复用当前 Ryzen AI 安装包自带且已针对 NPU 量化的 quicktest CNN，首次运行会由 VitisAI EP 编译并缓存；也可用 `--npu-model` 指定其他 ONNX 模型。
 
 ## 24GB LLM 端到端档位
 
@@ -153,20 +153,27 @@ MLBENCH_TORCH_INDEX_URL=https://rocm.nightlies.amd.com/v2/gfx1151/ \
 
 ### AMD Ryzen AI NPU
 
-NPU 需要 AMD 提供的 NPU 驱动、XRT 和 Ryzen AI 软件包。Linux 下先激活 Ryzen AI 安装器创建的 Python 环境并加载 XRT，然后运行：
+NPU 需要 AMD 提供的 NPU 驱动、XRT 和完整 Ryzen AI 软件包。`/dev/accel/accel0` 只代表内核驱动已枚举设备；PyPI 的通用 `onnxruntime` 不包含 `VitisAIExecutionProvider`，不能驱动 NPU。AMD 的 Linux 安装包需要单独下载并接受许可，因此本脚本不会用普通 wheel 伪装成 NPU 运行时。
+
+Ryzen AI 1.8 的官方 Linux 流程要求 Ubuntu 24.04 和 Python 3.12。安装并通过包内 `quicktest.py` 后，可直接指定安装器创建的 venv，无需手工激活：
 
 ```bash
-source /path/to/ryzen-ai-venv/bin/activate
-source /opt/xilinx/xrt/setup.sh
-./benchmark.sh --backend npu
+MLBENCH_NPU_PYTHON=/path/to/ryzen-ai-venv/bin/python \
+  ./benchmark.sh --backend npu
 ```
 
-工具会确认 `VitisAIExecutionProvider` 真正注册并成为首选 EP。测试图中不支持的算子可能由 CPU EP 回退执行，因此这是**端到端应用吞吐**，不是厂商标称的理论 NPU TOPS。
+若设置了 `RYZEN_AI_INSTALLATION_PATH`，或 venv 位于常见的 `$HOME/ryzenai*/venv*`、`/opt/AMD/ryzenai/venv*` 路径，启动器会自动发现它，并补齐 `XILINX_XRT`、`PATH` 和 `LD_LIBRARY_PATH`。针对 Ryzen AI 1.8，脚本还会自动加入 Peano 依赖目录，并把系统 XRT 放在厂商 venv 自带旧 XRT 之前，避免 EP 被误判为不可用或在创建 runner 时崩溃。`--backend all` 可以让 GPU 使用 ROCm venv、NPU 使用 Ryzen AI venv，结果仍汇总到同一报告。
 
-如当前 Ryzen AI 版本要求显式 BF16 编译配置，可使用仓库自带示例：
+工具会确认 `VitisAIExecutionProvider` 注册并成为首选 EP，还会读取 ONNX Runtime profiling，要求至少一个模型节点实际由 VitisAI EP 执行。测试图中不支持的算子仍可能由 CPU EP 回退，因此这是**端到端应用吞吐**，不是厂商标称的理论 NPU TOPS。
+
+Arch Linux 当前不在 AMD 官方 Ryzen AI 用户态支持范围。即使能看到 `/dev/accel/accel0`，仍需自行移植完整 Ryzen AI 1.8 用户态，或在 AMD 支持的 Ubuntu 24.04 环境中运行；仅安装 `amdxdna`/XRT 无法补出 Vitis AI EP。
+
+如需测试自己的模型或显式编译配置，可使用：
 
 ```bash
-./benchmark.sh --backend npu --npu-config config/vai_ep_config.json
+./benchmark.sh --backend npu \
+  --npu-model /path/to/model.onnx \
+  --npu-config /path/to/vai_ep_config.json
 ```
 
 ## 常用命令
@@ -217,7 +224,7 @@ PYTHONPATH=. python -m mlbench run --backend cpu --profile quick
 - `device_copy`：一次拷贝按一次读取加一次写入计算 GB/s，不等同于厂商标称显存带宽。
 - `synthetic_cnn`：固定 224×224 输入的四层卷积网络端到端吞吐，单位 images/s。
 - `synthetic_mlp`：`gfx1151` 的无卷积兼容推理负载，单位 samples/s；不可与 `synthetic_cnn` 横向比较。
-- `synthetic_cnn_latency`：NPU 同步推理 P50；P95 和均值写在 JSON 的 `details` 中。
+- `ryzen_ai_quicktest_cnn_latency`：NPU quicktest CNN 同步推理 P50；P95 和均值写在 JSON 的 `details` 中。
 - `llm_ttft_p50`：输入已驻留 GPU 后，模型 prefill 与贪心选出首 token 的 P50 时间；P95/均值写在 `details`。
 - `llm_prefill`：以输入 token 数除以 TTFT 得到的 prefill 吞吐估计。
 - `llm_decode`：在同一条 KV-cache 生成链中直接测量首 token 之后的持续解码吞吐，不使用两次独立计时相减。
@@ -247,6 +254,7 @@ PYTHONPATH=. python -m mlbench run --backend cpu --profile quick
 - [AMD Ryzen APU Linux 支持矩阵](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/compatibility/compatibilityryz/native_linux/native_linux_compatibility.html)
 - [TheRock `gfx1151` 架构专用 wheel](https://github.com/ROCm/TheRock/blob/main/docs/packaging/legacy_per_family_releases.md)
 - [Ryzen AI Linux 安装](https://ryzenai.docs.amd.com/en/latest/linux.html)
+- [Ryzen AI 1.8 发布说明](https://ryzenai.docs.amd.com/en/main/relnotes.html)
 - [Ryzen AI VitisAI EP 模型运行](https://ryzenai.docs.amd.com/en/latest/modelrun.html)
 - [NVIDIA SMI 查询字段](https://docs.nvidia.com/deploy/nvidia-smi/index.html)
 - [AMD SMI CLI](https://rocm.docs.amd.com/projects/amdsmi/en/latest/how-to/amdsmi-cli-tool.html)

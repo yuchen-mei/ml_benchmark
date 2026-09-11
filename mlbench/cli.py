@@ -17,7 +17,7 @@ from .llm import (
     resolve_llm_configuration,
     run_llm_benchmarks,
 )
-from .npu import run_npu_benchmarks
+from .npu_isolation import run_npu_benchmarks_isolated
 from .report import print_results, save_report
 
 
@@ -51,6 +51,7 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--device", default="all", help="GPU 编号，如 0 或 0,1")
     run.add_argument("--npu-streams", type=int, default=1, help="NPU 并发请求数")
     run.add_argument("--npu-config", default=None, help="可选 VitisAI EP config_file")
+    run.add_argument("--npu-model", default=None, help="可选 ONNX 模型；默认使用 Ryzen AI quicktest 模型")
     run.add_argument(
         "--llm-preset",
         choices=sorted(LLM_PRESETS),
@@ -268,8 +269,10 @@ def _run(args: argparse.Namespace) -> int:
                 )
         elif backend == "npu":
             if "inference" in suites:
+                executable = environment["runtime"]["onnxruntime"].get("executable", sys.executable)
                 results.extend(
-                    run_npu_benchmarks(
+                    run_npu_benchmarks_isolated(
+                        executable,
                         output_dir,
                         args.profile,
                         args.duration,
@@ -277,6 +280,7 @@ def _run(args: argparse.Namespace) -> int:
                         args.warmup,
                         args.npu_streams,
                         args.npu_config,
+                        args.npu_model,
                         not args.no_power,
                         args.power_interval,
                     )

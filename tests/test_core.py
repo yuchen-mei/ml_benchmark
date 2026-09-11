@@ -1,8 +1,11 @@
+import json
 import math
 import os
 import signal
 import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from argparse import Namespace
@@ -15,7 +18,7 @@ from mlbench.cli import (
     _selected_backends,
     _validate_arguments,
 )
-from mlbench.detect import _torch_runtime
+from mlbench.detect import _npu_runtime_warnings, _ort_runtime, _torch_runtime
 from mlbench.gpu import _is_gfx1151 as uses_gfx1151_fallback
 from mlbench.isolation import run_gpu_benchmarks_isolated
 from mlbench.llm import (
@@ -24,6 +27,9 @@ from mlbench.llm import (
     resolve_llm_configuration,
     vram_budget_gib,
 )
+from mlbench.npu import _make_feed, _profile_provider_counts, _quicktest_model
+from mlbench.npu_isolation import run_npu_benchmarks_isolated
+from mlbench.npu_runtime import npu_subprocess_environment
 from mlbench.power import _json_power, _text_power, add_power_details
 from mlbench.report import _display_width, _pad_display, format_results
 from mlbench.stats import percentile
@@ -123,6 +129,117 @@ class NativeCrashTests(unittest.TestCase):
     def test_gfx1151_uses_safe_inference_fallback(self):
         self.assertTrue(uses_gfx1151_fallback("rocm", "gfx1151:sramecc+:xnack-"))
         self.assertFalse(uses_gfx1151_fallback("cuda", "gfx1151"))
+
+    def test_external_npu_runtime_probe(self):
+        payload = (
+            '__MLBENCH_ORT_PROBE__={"installed":true,"version":"1.23.3",'
+            '"providers":["VitisAIExecutionProvider","CPUExecutionProvider"]}\n'
+        )
+        completed = subprocess.CompletedProcess([], 0, payload, "")
+        with (
+            patch.dict("os.environ", {"MLBENCH_NPU_PYTHON": "/opt/ryzenai/venv/bin/python"}),
+            patch("mlbench.detect.subprocess.run", return_value=completed),
+        ):
+            runtime = _ort_runtime()
+        self.assertTrue(runtime["external"])
+        self.assertIn("VitisAIExecutionProvider", runtime["providers"])
+
+    def test_npu_sigsegv_becomes_diagnostic_result(self):
+        completed = subprocess.CompletedProcess([], -signal.SIGSEGV, "", "")
+        with patch("mlbench.npu_isolation.subprocess.run", return_value=completed):
+            results = run_npu_benchmarks_isolated(
+                "/opt/ryzenai/venv/bin/python",
+                Path("/tmp/results"),
+                "quick",
+                None,
+                0,
+                0,
+                1,
+                None,
+                None,
+                False,
+                0.1,
+            )
+        self.assertTrue(results[0]["details"]["worker_failure"])
+        self.assertIn("SIGSEGV", results[0]["details"]["reason"])
+
+
+class NpuRuntimeTests(unittest.TestCase):
+    def test_generic_onnxruntime_warning_is_actionable(self):
+        with patch("mlbench.detect._is_ubuntu_2404", return_value=False):
+            warnings = _npu_runtime_warnings(
+                "Linux",
+                {
+                    "installed": True,
+                    "executable": "/usr/bin/python",
+                    "providers": ["CPUExecutionProvider"],
+                },
+            )
+        self.assertIn("PyPI 通用 onnxruntime", warnings[0])
+        self.assertIn("Ubuntu 24.04", warnings[1])
+
+    def test_runtime_environment_adds_xrt_and_ort_libraries(self):
+        with patch.dict("os.environ", {}, clear=True):
+            environment = npu_subprocess_environment("/opt/ryzenai/venv/bin/python")
+        self.assertEqual(environment["RYZEN_AI_INSTALLATION_PATH"], "/opt/ryzenai/venv")
+        self.assertIn("/opt/ryzenai/venv/onnxruntime/lib", environment["LD_LIBRARY_PATH"])
+        self.assertIn("/opt/xilinx/xrt/lib", environment["LD_LIBRARY_PATH"])
+
+    def test_ryzenai_18_libraries_keep_system_xrt_first(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "venv"
+            site_packages = root / "lib/python3.12/site-packages"
+            peano = site_packages / "lnx64.o/tools/peano/lib"
+            voe = site_packages / "voe/lib"
+            peano.mkdir(parents=True)
+            voe.mkdir(parents=True)
+            executable = root / "bin/python"
+            existing = f"{voe}:/legacy/lib"
+            with patch.dict(
+                "os.environ",
+                {"LD_LIBRARY_PATH": existing, "XILINX_XRT": "/opt/xilinx/xrt"},
+                clear=True,
+            ):
+                environment = npu_subprocess_environment(str(executable))
+        libraries = environment["LD_LIBRARY_PATH"].split(":")
+        self.assertEqual(libraries[0], "/opt/xilinx/xrt/lib")
+        self.assertIn(str(peano), libraries)
+        self.assertLess(libraries.index("/opt/xilinx/xrt/lib"), libraries.index(str(voe)))
+
+    def test_uses_bundled_quicktest_model(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "venv"
+            model = root / "quicktest/model.onnx"
+            model.parent.mkdir(parents=True)
+            model.touch()
+            with patch.dict("os.environ", {"RYZEN_AI_INSTALLATION_PATH": str(root)}):
+                selected, source = _quicktest_model(None)
+        self.assertEqual(selected, model.resolve())
+        self.assertEqual(source, "ryzen_ai_quicktest")
+
+    def test_quicktest_feed_resolves_dynamic_batch(self):
+        metadata = type(
+            "InputMetadata",
+            (),
+            {"name": "input", "type": "tensor(float)", "shape": [None, 3, 32, 32]},
+        )()
+        import numpy as np
+
+        feed, batch = _make_feed([metadata], 4, np.random.default_rng(9))
+        self.assertEqual(feed["input"].shape, (4, 3, 32, 32))
+        self.assertEqual(batch, 4)
+
+    def test_profile_proves_vitisai_execution(self):
+        events = [
+            {"args": {"provider": "CPUExecutionProvider"}},
+            {"args": {"provider": "VitisAIExecutionProvider"}},
+            {"args": {"provider": "VitisAIExecutionProvider"}},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "profile.json"
+            path.write_text(json.dumps(events), encoding="utf-8")
+            counts = _profile_provider_counts(path)
+        self.assertEqual(counts["VitisAIExecutionProvider"], 2)
 
 
 class LLMTests(unittest.TestCase):
