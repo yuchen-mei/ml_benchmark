@@ -1,4 +1,5 @@
 import math
+import os
 import signal
 import subprocess
 import unittest
@@ -17,7 +18,12 @@ from mlbench.cli import (
 from mlbench.detect import _torch_runtime
 from mlbench.gpu import _is_gfx1151 as uses_gfx1151_fallback
 from mlbench.isolation import run_gpu_benchmarks_isolated
-from mlbench.llm import generation_metrics, resolve_llm_configuration, vram_budget_gib
+from mlbench.llm import (
+    configure_llm_runtime,
+    generation_metrics,
+    resolve_llm_configuration,
+    vram_budget_gib,
+)
 from mlbench.power import _json_power, _text_power, add_power_details
 from mlbench.report import _display_width, _pad_display, format_results
 from mlbench.stats import percentile
@@ -120,6 +126,16 @@ class NativeCrashTests(unittest.TestCase):
 
 
 class LLMTests(unittest.TestCase):
+    def test_llm_runtime_disables_optional_native_jit_by_default(self):
+        with patch.dict(os.environ, {}, clear=True):
+            configure_llm_runtime()
+            self.assertEqual(os.environ["TORCH_DISABLE_NATIVE_JIT"], "1")
+
+    def test_llm_runtime_preserves_explicit_native_jit_opt_in(self):
+        with patch.dict(os.environ, {"TORCH_DISABLE_NATIVE_JIT": "0"}):
+            configure_llm_runtime()
+            self.assertEqual(os.environ["TORCH_DISABLE_NATIVE_JIT"], "0")
+
     def test_presets_fit_expected_quantization(self):
         _, qwen_model, qwen_quantization, qwen_estimate = resolve_llm_configuration(
             "qwen", None, "auto"
@@ -154,12 +170,23 @@ class LLMTests(unittest.TestCase):
         self.assertEqual(vram_budget_gib(16.0, 15.0), 13.0)
 
     def test_generation_metrics_separate_prefill_and_decode(self):
-        metrics = generation_metrics([0.1, 0.2], [1.0, 1.2], [20, 20], 10, 1)
+        metrics = generation_metrics(
+            [0.1, 0.2],
+            [0.9, 1.0],
+            [1.0, 1.2],
+            [20, 20],
+            10,
+            1,
+        )
         self.assertAlmostEqual(metrics["ttft_p50_ms"], 150.0)
         self.assertAlmostEqual(metrics["prefill_tokens_per_second"], 20.0 / 0.3)
         self.assertAlmostEqual(metrics["decode_tokens_per_second"], 38.0 / 1.9)
         self.assertAlmostEqual(metrics["output_tokens_per_second"], 40.0 / 2.2)
         self.assertAlmostEqual(metrics["e2e_p50_seconds"], 1.1)
+
+    def test_decode_metric_does_not_subtract_independent_ttft(self):
+        metrics = generation_metrics([0.4], [0.1], [0.2], [4], 32, 1)
+        self.assertAlmostEqual(metrics["decode_tokens_per_second"], 30.0)
 
 
 class PowerTests(unittest.TestCase):

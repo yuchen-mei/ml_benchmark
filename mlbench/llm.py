@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import importlib.util
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -97,24 +98,26 @@ def vram_budget_gib(
 
 def generation_metrics(
     ttft_seconds: list[float],
+    decode_seconds: list[float],
     e2e_seconds: list[float],
     output_token_counts: list[int],
     prompt_tokens: int,
     batch_size: int,
 ) -> dict[str, float]:
     runs = len(e2e_seconds)
-    total_ttft = sum(ttft_seconds)
     total_e2e = sum(e2e_seconds)
     total_output_tokens = sum(output_token_counts)
     first_tokens = batch_size * runs
     decode_tokens = max(0, total_output_tokens - first_tokens)
-    decode_seconds = max(1e-9, total_e2e - total_ttft)
     return {
         "ttft_p50_ms": percentile(ttft_seconds, 50) * 1000.0,
         "ttft_p95_ms": percentile(ttft_seconds, 95) * 1000.0,
         "ttft_mean_ms": mean(ttft_seconds) * 1000.0,
-        "prefill_tokens_per_second": prompt_tokens * batch_size * runs / max(total_ttft, 1e-9),
-        "decode_tokens_per_second": decode_tokens / decode_seconds,
+        "prefill_tokens_per_second": prompt_tokens
+        * batch_size
+        * runs
+        / max(sum(ttft_seconds), 1e-9),
+        "decode_tokens_per_second": decode_tokens / max(sum(decode_seconds), 1e-9),
         "output_tokens_per_second": total_output_tokens / max(total_e2e, 1e-9),
         "e2e_p50_seconds": percentile(e2e_seconds, 50),
         "e2e_p95_seconds": percentile(e2e_seconds, 95),
@@ -142,6 +145,7 @@ def run_llm_benchmarks(
     power_enabled: bool,
     power_interval: float,
 ) -> list[dict[str, Any]]:
+    configure_llm_runtime()
     preset, model_id, active_quantization, estimate = resolve_llm_configuration(
         preset_name, model_override, quantization
     )
@@ -150,6 +154,7 @@ def run_llm_benchmarks(
             f"{preset.name} 需要执行模型仓库代码；确认来源后添加 --trust-remote-code"
         )
     torch, auto_model, auto_tokenizer, quantization_config = _dependencies(active_quantization)
+    _disable_registered_native_jit(torch)
 
     results: list[dict[str, Any]] = []
     for index in device_indices:
@@ -305,6 +310,13 @@ def _run_device(
             "do_sample": False,
             "num_beams": 1,
             "pad_token_id": pad_token_id,
+            "temperature": None,
+            "top_p": None,
+            "top_k": None,
+            "min_p": None,
+            "typical_p": None,
+            "epsilon_cutoff": None,
+            "eta_cutoff": None,
             "use_cache": True,
         }
 
@@ -329,22 +341,23 @@ def _run_device(
                 device_index,
             )
 
+        torch.cuda.reset_peak_memory_stats(device_index)
         ttft_seconds = []
+        decode_seconds = []
         for _ in range(runs):
-            elapsed, _ = _timed_generate(
+            ttft, decode = _timed_generation_phases(
                 torch,
                 model,
-                tokenizer,
                 cpu_input_ids,
                 cpu_attention_mask,
                 target_device,
-                1,
+                new_tokens,
                 generation_args,
                 device_index,
             )
-            ttft_seconds.append(elapsed)
+            ttft_seconds.append(ttft)
+            decode_seconds.append(decode)
 
-        torch.cuda.reset_peak_memory_stats(device_index)
         e2e_seconds = []
         output_token_counts = []
         sampler = PowerSampler(power_reader, power_interval)
@@ -373,6 +386,7 @@ def _run_device(
 
         metrics = generation_metrics(
             ttft_seconds,
+            decode_seconds,
             e2e_seconds,
             output_token_counts,
             prompt_tokens,
@@ -392,7 +406,9 @@ def _run_device(
             "vram_budget_gib": budget_gib,
             "physical_vram_gib": total_gib,
             "model_context_limit": context_limit,
-            "timing_scope": "host-to-device + model.generate + output decode",
+            "phase_timing_scope": "model.generate CUDA timeline with KV cache",
+            "e2e_timing_scope": "host-to-device + model.generate + output decode",
+            "torch_native_jit_disabled": os.environ.get("TORCH_DISABLE_NATIVE_JIT") == "1",
         }
         if power and power.get("status") == "ok" and metrics["total_output_tokens"]:
             common["energy_per_output_token_j"] = (
@@ -490,6 +506,19 @@ def _preferred_dtype(torch: Any) -> tuple[Any, str]:
     return torch.float16, "fp16"
 
 
+def configure_llm_runtime() -> None:
+    os.environ.setdefault("TORCH_DISABLE_NATIVE_JIT", "1")
+
+
+def _disable_registered_native_jit(torch: Any) -> None:
+    if os.environ.get("TORCH_DISABLE_NATIVE_JIT") != "1":
+        return
+    try:
+        torch._native.triton_utils.deregister_op_overrides()
+    except (AttributeError, ImportError):
+        pass
+
+
 def _transformers_dtype_key() -> str:
     import transformers
 
@@ -562,6 +591,61 @@ def _timed_generate(
     output_tokens = int(generated.numel())
     del input_ids, attention_mask, output, generated
     return elapsed, output_tokens
+
+
+class _CudaEventCriteria:
+    def __init__(self, torch: Any) -> None:
+        self.torch = torch
+        self.events: list[Any] = []
+
+    def __call__(self, input_ids: Any, scores: Any, **kwargs: Any) -> Any:
+        del scores, kwargs
+        event = self.torch.cuda.Event(enable_timing=True)
+        event.record()
+        self.events.append(event)
+        return self.torch.zeros(
+            input_ids.shape[0],
+            dtype=self.torch.bool,
+            device=input_ids.device,
+        )
+
+
+def _timed_generation_phases(
+    torch: Any,
+    model: Any,
+    cpu_input_ids: Any,
+    cpu_attention_mask: Any,
+    target_device: Any,
+    new_tokens: int,
+    generation_args: dict[str, Any],
+    device_index: int,
+) -> tuple[float, float]:
+    from transformers.generation.stopping_criteria import StoppingCriteriaList
+
+    input_ids = cpu_input_ids.to(target_device)
+    attention_mask = cpu_attention_mask.to(target_device)
+    torch.cuda.synchronize(device_index)
+    start_event = torch.cuda.Event(enable_timing=True)
+    criteria = _CudaEventCriteria(torch)
+    start_event.record()
+    with torch.inference_mode():
+        output = model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=new_tokens,
+            min_new_tokens=new_tokens,
+            stopping_criteria=StoppingCriteriaList([criteria]),
+            **generation_args,
+        )
+    torch.cuda.synchronize(device_index)
+    if len(criteria.events) != new_tokens:
+        raise RuntimeError(
+            f"逐 token 计时只收到 {len(criteria.events)}/{new_tokens} 个事件，无法计算解码吞吐"
+        )
+    ttft_seconds = start_event.elapsed_time(criteria.events[0]) / 1000.0
+    decode_seconds = criteria.events[0].elapsed_time(criteria.events[-1]) / 1000.0
+    del input_ids, attention_mask, output, criteria
+    return ttft_seconds, decode_seconds
 
 
 def _verify_gpu_only_placement(model: Any, device_index: int) -> None:

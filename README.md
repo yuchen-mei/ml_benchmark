@@ -218,9 +218,9 @@ PYTHONPATH=. python -m mlbench run --backend cpu --profile quick
 - `synthetic_cnn`：固定 224×224 输入的四层卷积网络端到端吞吐，单位 images/s。
 - `synthetic_mlp`：`gfx1151` 的无卷积兼容推理负载，单位 samples/s；不可与 `synthetic_cnn` 横向比较。
 - `synthetic_cnn_latency`：NPU 同步推理 P50；P95 和均值写在 JSON 的 `details` 中。
-- `llm_ttft_p50`：首 token P50 时间，包含输入搬运、一次 `generate()` 和首 token 解码；P95/均值写在 `details`。
+- `llm_ttft_p50`：输入已驻留 GPU 后，模型 prefill 与贪心选出首 token 的 P50 时间；P95/均值写在 `details`。
 - `llm_prefill`：以输入 token 数除以 TTFT 得到的 prefill 吞吐估计。
-- `llm_decode`：从完整生成时间中扣除 TTFT 后的持续解码吞吐，单位 tokens/s。
+- `llm_decode`：在同一条 KV-cache 生成链中直接测量首 token 之后的持续解码吞吐，不使用两次独立计时相减。
 - `llm_output_e2e`：完整请求的输出 token 吞吐，计入输入搬运、`generate()` 和输出解码。
 - `llm_e2e_p50`：完整请求 P50 延迟；P95/均值写在 `details`。
 - `llm_peak_vram`：预热后完整生成期间 PyTorch 记录的峰值显存；模型静态占用同时写入 `details.model_vram_gib`。
@@ -237,6 +237,7 @@ PYTHONPATH=. python -m mlbench run --backend cpu --profile quick
 - 功耗来自驱动遥测而非外置功率计；NPU 平台若不暴露 electrical/telemetry 传感器，会明确标记为跳过。
 - `quick` 用于验证，`standard` 用于日常比较，`extended` 用于较稳定的长时间测量。
 - `llm` 使用真实模型权重，首次运行的下载与模型加载时间单独记录，不计入生成吞吐；不同模型、量化方式和 token 长度不能直接混为同一排名。
+- `llm` 默认设置 `TORCH_DISABLE_NATIVE_JIT=1`，避开需要本机 C 编译器与 Python 开发头文件的实验性 PyTorch native-JIT 路由；已配置完整编译环境时可显式设为 `0`，但两种模式的成绩不应直接混比。
 
 ## 官方运行时文档
 

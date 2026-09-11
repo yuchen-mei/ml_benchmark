@@ -11,7 +11,12 @@ from . import __version__
 from .detect import detect_environment, render_doctor
 from .gpu import run_cpu_benchmarks
 from .isolation import run_gpu_benchmarks_isolated
-from .llm import LLM_PRESETS, resolve_llm_configuration, run_llm_benchmarks
+from .llm import (
+    LLM_PRESETS,
+    configure_llm_runtime,
+    resolve_llm_configuration,
+    run_llm_benchmarks,
+)
 from .npu import run_npu_benchmarks
 from .report import print_results, save_report
 
@@ -186,8 +191,10 @@ def _validate_arguments(args: argparse.Namespace, suites: set[str]) -> None:
 
 
 def _run(args: argparse.Namespace) -> int:
-    environment = detect_environment()
     suites = _resolve_suites(args.profile, args.suite)
+    if "llm" in suites:
+        configure_llm_runtime()
+    environment = detect_environment()
     _validate_arguments(args, suites)
     backends = _selected_backends(args.backend, environment["available_backends"])
     if "llm" in suites:
