@@ -17,6 +17,8 @@ def print_results(results: list[dict[str, Any]]) -> None:
 def format_results(results: list[dict[str, Any]], terminal_width: int = 120) -> str:
     groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for item in results:
+        if item["suite"] == "llm" or "requested_precision" in item.get("details", {}):
+            continue
         groups[(item["backend"], item["device"])].append(item)
 
     lines = ["测试结果"]
@@ -27,7 +29,59 @@ def format_results(results: list[dict[str, Any]], terminal_width: int = 120) -> 
             lines.extend(table)
         else:
             lines.extend(_stacked_results(items))
+        if backend == "coreml":
+            for item in items:
+                if "placement" in item.get("details", {}):
+                    lines.append(_placement_note(item["details"]["placement"]))
+                    break
+    lines.extend(_llm_tables(results, terminal_width))
     return "\n".join(lines)
+
+
+def _llm_tables(results: list[dict[str, Any]], terminal_width: int) -> list[str]:
+    groups = defaultdict(dict)
+    for item in results:
+        if item["suite"] != "llm":
+            continue
+        detail = item.get("details", {})
+        group = (item["backend"], item["device"], detail.get("model", "unknown"),
+                 detail.get("batch_size", 1), detail.get("new_tokens_per_request"))
+        key = (detail.get("requested_precision", item["precision"]), detail.get("prompt_tokens_per_request"))
+        groups[group].setdefault(key, {})[item["test"]] = item
+    lines = []
+    metrics = ("llm_ttft_p50", "llm_prefill", "llm_decode", "llm_output_e2e", "llm_peak_vram")
+    headers = ["精度", "输入 tokens", "TTFT ms", "Prefill tok/s", "Decode tok/s", "E2E tok/s", "峰值 GiB"]
+    for (backend, device, model, batch, output), cases in groups.items():
+        lines.extend(["", f"[{backend}] {device} / {model}", f"batch {batch}; 每请求输出 {output} tokens"])
+        rows, reasons = [], []
+        for (precision, prompt), items in cases.items():
+            row = [precision, str(prompt)]
+            for metric in metrics:
+                value = items.get(metric, {}).get("value")
+                row.append(f"{value:.3f}" if value is not None else "-")
+            rows.append(row)
+            for item in items.values():
+                if item["status"] != "ok":
+                    reasons.append(f"! {precision} / {prompt} tokens: {item['details'].get('reason', 'unknown')}")
+        widths = [max(_display_width(header), *(_display_width(row[i]) for row in rows))
+                  for i, header in enumerate(headers)]
+        border = "+" + "+".join("-" * (width + 2) for width in widths) + "+"
+        if _display_width(border) <= terminal_width:
+            lines.extend([border, _table_line(headers, widths, ["left"] * len(headers)), border])
+            lines.extend(_table_line(row, widths, ["left"] + ["right"] * 6) for row in rows)
+            lines.append(border)
+        else:
+            for row in rows:
+                lines.append(f"- {row[0]} / {row[1]} input tokens")
+                lines.extend(f"  {header}: {value}" for header, value in zip(headers[2:], row[2:]))
+        lines.extend(reasons)
+    return lines
+
+
+def _placement_note(placement: dict[str, Any]) -> str:
+    planned = placement.get("neural_engine_planned")
+    status = "包含 Neural Engine" if planned else "未分配到 Neural Engine" if planned is False else "无法确认 Neural Engine 分配"
+    return f"Core ML 编译计划：{status}；结果为端到端推理，包含可能的 CPU 回退。"
 
 
 def _result_table(results: list[dict[str, Any]]) -> list[str]:
@@ -128,6 +182,9 @@ def save_report(
     environment: dict[str, Any],
     arguments: dict[str, Any],
     results: list[dict[str, Any]],
+    *,
+    paths: tuple[Path, Path] | None = None,
+    complete: bool = True,
 ) -> tuple[Path, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S_%f")
@@ -137,11 +194,14 @@ def save_report(
         "environment": environment,
         "arguments": arguments,
         "results": results,
+        "complete": complete,
     }
-    json_path = output_dir / f"mlbench_{timestamp}.json"
-    markdown_path = output_dir / f"mlbench_{timestamp}.md"
-    json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    markdown_path.write_text(_markdown(payload), encoding="utf-8")
+    json_path, markdown_path = paths or (output_dir / f"mlbench_{timestamp}.json", output_dir / f"mlbench_{timestamp}.md")
+    for path, content in [(json_path, json.dumps(payload, ensure_ascii=False, indent=2)),
+                          (markdown_path, _markdown(payload))]:
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text(content, encoding="utf-8")
+        temporary.replace(path)
     return json_path, markdown_path
 
 
@@ -155,25 +215,28 @@ def _markdown(payload: dict[str, Any]) -> str:
         f"- Python: `{system['python']}`",
         f"- Backends: `{', '.join(payload['environment']['available_backends'])}`",
     ]
-    llm_result = next((item for item in payload["results"] if item["suite"] == "llm"), None)
-    if llm_result is not None:
-        details = llm_result.get("details", {})
-        lines.extend(
-            [
-                f"- LLM: `{details.get('model', 'unknown')}` (`{llm_result['precision']}`)",
-                f"- Workload: `{details.get('prompt_tokens_per_request')} input + "
-                f"{details.get('new_tokens_per_request')} output tokens`, "
-                f"batch `{details.get('batch_size')}`, runs `{details.get('runs')}`",
-                f"- VRAM: model `{details.get('model_vram_gib', 0):.2f} GiB`, "
-                f"peak `{details.get('peak_vram_gib', 0):.2f} GiB`, "
-                f"budget `{details.get('vram_budget_gib', 0):.2f} GiB`",
-            ]
-        )
+    apple = payload["environment"]["hardware"].get("apple_silicon", {})
+    if apple.get("detected"):
+        lines.append(f"- Apple Silicon: `{apple['name']}`, unified memory `{apple['unified_memory_bytes'] / 1024**3:.0f} GiB`")
+    llm_results = [item for item in payload["results"] if item["suite"] == "llm"]
+    if llm_results:
+        models = sorted({item.get("details", {}).get("model", "unknown") for item in llm_results})
+        precisions = sorted({item.get("details", {}).get("requested_precision", item["precision"]) for item in llm_results})
+        prompts = sorted({item["details"]["prompt_tokens_per_request"] for item in llm_results
+                          if item.get("details", {}).get("prompt_tokens_per_request") is not None})
+        lines.extend([
+            f"- Models: {', '.join(f'`{model}`' for model in models)}",
+            f"- Precisions: `{', '.join(precisions)}`",
+            f"- Prefill lengths: `{prompts}` tokens per request",
+            "- Model/peak memory and per-case timing are recorded in the rows and JSON details.",
+        ])
+    if not payload.get("complete", True):
+        lines.extend(["", "> Partial report: benchmark is still running or was interrupted."])
     lines.extend(
         [
             "",
-            "| Backend | Device | Suite | Test | Precision | Result | Avg Power | Peak Power | Energy | Efficiency |",
-            "|---|---|---|---|---|---:|---:|---:|---:|---:|",
+            "| Backend | Device | Model | Input tokens | Output tokens | Suite | Test | Precision | Result | Avg Power | Peak Power | Energy | Efficiency |",
+            "|---|---|---|---:|---:|---|---|---|---:|---:|---:|---:|---:|",
         ]
     )
     for item in payload["results"]:
@@ -186,6 +249,9 @@ def _markdown(payload: dict[str, Any]) -> str:
         fields = [
             item["backend"],
             item["device"],
+            item.get("details", {}).get("model", "-"),
+            item.get("details", {}).get("prompt_tokens_per_request", "-"),
+            item.get("details", {}).get("new_tokens_per_request", "-"),
             item["suite"],
             item["test"],
             item["precision"],
@@ -195,15 +261,24 @@ def _markdown(payload: dict[str, Any]) -> str:
             _format_optional(power.get("energy_j"), "J"),
             _format_optional(efficiency.get("value"), efficiency.get("unit", "")),
         ]
-        lines.append("| " + " | ".join(str(field).replace("|", "\\|") for field in fields) + " |")
+        lines.append("| " + " | ".join("<br>".join(str(field).splitlines()).replace("|", "\\|")
+                                      for field in fields) + " |")
     lines.extend(
         [
             "",
             "> TFLOP/s is calculated from dense GEMM operation count. It is not the vendor's theoretical TOPS rating.",
-            "> NPU results use VitisAI EP with CPU fallback enabled for unsupported graph nodes.",
+            "> AMD NPU results use VitisAI EP with CPU fallback enabled for unsupported graph nodes.",
             "",
         ]
     )
+    for item in payload["results"]:
+        if item["backend"] == "coreml" and item["test"] == "synthetic_cnn":
+            lines.append(f"> {item['device']}: {_placement_note(item['details'].get('placement', {}))}")
+    if any(item["backend"] in {"mps", "mlx", "coreml"} for item in payload["results"]):
+        lines.extend([
+            "> Apple GPU timings include command submission and synchronization. Memory is shared with macOS.",
+            "> Core ML placement is a compiler plan, not measured Neural Engine utilization. Apple power telemetry is unavailable in this runner.",
+        ])
     return "\n".join(lines)
 
 

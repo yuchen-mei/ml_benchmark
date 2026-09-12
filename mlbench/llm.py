@@ -76,7 +76,7 @@ def resolve_llm_configuration(
     active_quantization = (
         preset.default_quantization if quantization == "auto" and model_override is None else quantization
     )
-    if active_quantization == "auto":
+    if active_quantization in {"auto", "fp32", "fp16", "bf16"}:
         active_quantization = "none"
     estimates = {
         "none": preset.full_precision_vram_gib,
@@ -84,6 +84,8 @@ def resolve_llm_configuration(
         "4bit": preset.int4_vram_gib,
     }
     estimate = estimates[active_quantization] if model_override is None else None
+    if quantization == "fp32" and estimate is not None:
+        estimate *= 2
     return preset, model_id, active_quantization, estimate
 
 
@@ -169,6 +171,7 @@ def run_llm_benchmarks(
                 preset=preset,
                 model_id=model_id,
                 quantization=active_quantization,
+                requested_dtype=quantization if quantization in {"fp32", "fp16", "bf16"} else "auto",
                 estimated_vram_gib=estimate,
                 prompt_tokens=prompt_tokens,
                 new_tokens=new_tokens,
@@ -215,6 +218,7 @@ def _run_device(
     preset: LLMPreset,
     model_id: str,
     quantization: str,
+    requested_dtype: str,
     estimated_vram_gib: float | None,
     prompt_tokens: int,
     new_tokens: int,
@@ -245,7 +249,7 @@ def _run_device(
             f"当前 24GB 安全预算仅 {budget_gib:.1f} GiB；请释放显存或改用更小/量化模型"
         )
 
-    dtype, dtype_label = _preferred_dtype(torch)
+    dtype, dtype_label = _selected_dtype(torch, requested_dtype)
     precision = dtype_label
     load_kwargs: dict[str, Any] = {
         "cache_dir": str(cache_dir) if cache_dir else None,
@@ -285,6 +289,8 @@ def _run_device(
             raise RuntimeError(_load_failure_message(preset, model_id, quantization, exc)) from exc
         load_seconds = time.perf_counter() - load_started
         _verify_gpu_only_placement(model, device_index)
+        if requested_dtype != "auto" and getattr(model, "is_quantized", False):
+            raise ValueError("源模型已量化，无法作为原始浮点精度基准；请提供未量化权重")
 
         model_vram_gib = max(
             float(model.get_memory_footprint()) / GIB,
@@ -396,6 +402,7 @@ def _run_device(
             "preset": preset.name,
             "model": model_id,
             "quantization": quantization,
+            "parameter_dtype": dtype_label,
             "batch_size": batch_size,
             "prompt_tokens_per_request": prompt_tokens,
             "new_tokens_per_request": new_tokens,
@@ -504,6 +511,17 @@ def _preferred_dtype(torch: Any) -> tuple[Any, str]:
     if supports_bf16 is not None and supports_bf16():
         return torch.bfloat16, "bf16"
     return torch.float16, "fp16"
+
+
+def _selected_dtype(torch: Any, requested: str) -> tuple[Any, str]:
+    if requested == "auto":
+        return _preferred_dtype(torch)
+    if requested == "bf16" and not torch.cuda.is_bf16_supported():
+        raise RuntimeError("当前 GPU 不支持 BF16")
+    if requested == "fp32":
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+    return {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[requested], requested
 
 
 def configure_llm_runtime() -> None:

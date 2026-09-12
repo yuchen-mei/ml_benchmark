@@ -25,6 +25,8 @@ def run_gpu_benchmarks_isolated(
     power_interval: float,
     device_labels: dict[int, str] | None = None,
     device_architectures: dict[int, str] | None = None,
+    apple_memory_limit_gib: float = 0,
+    mps_matmul: str = "auto",
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     labels = device_labels or {}
@@ -32,6 +34,11 @@ def run_gpu_benchmarks_isolated(
     for index in device_indices:
         architecture = architectures.get(index, "")
         environment = os.environ.copy()
+        if backend == "mps":
+            # A GPU benchmark must never silently execute unsupported ops on the CPU.
+            environment["PYTORCH_ENABLE_MPS_FALLBACK"] = "0"
+            if mps_matmul != "auto":
+                environment["PYTORCH_MPS_PREFER_METAL"] = "1" if mps_matmul == "metal" else "0"
         if backend == "rocm" and _is_gfx1151(architecture):
             environment.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
             if "backend:malloc" in environment.get("PYTORCH_HIP_ALLOC_CONF", ""):
@@ -55,6 +62,7 @@ def run_gpu_benchmarks_isolated(
                 "device_architecture": architecture,
                 "precisions": sorted(task_precisions) if task_precisions else None,
                 "include_idle": idle_pending,
+                "apple_memory_limit_gib": apple_memory_limit_gib,
             }
             try:
                 completed = subprocess.run(

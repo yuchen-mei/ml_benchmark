@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import math
+import os
 import time
 from contextlib import contextmanager
 from typing import Any, Callable
@@ -60,6 +61,9 @@ def _duration(profile: str, requested: float | None) -> float:
 
 @contextmanager
 def _matmul_mode(torch: Any, backend: str, tf32: bool):
+    if backend == "mps":
+        yield
+        return
     matmul = torch.backends.cuda.matmul
     cudnn = torch.backends.cudnn
     original_matmul = getattr(matmul, "allow_tf32", None)
@@ -84,7 +88,10 @@ def _time_gpu_operation(
     warmup: int,
     power_reader: PowerReader | None,
     power_interval: float,
+    backend: str = "cuda",
 ) -> tuple[float, int, dict[str, Any] | None]:
+    if backend == "mps":
+        return _time_mps_operation(torch, operation, duration, warmup, power_reader, power_interval)
     for _ in range(warmup):
         operation()
     torch.cuda.synchronize()
@@ -125,6 +132,42 @@ def _time_gpu_operation(
         )
     power = sampler.stop(elapsed_seconds)
     return elapsed_seconds, total_runs, power
+
+
+def _time_mps_operation(torch: Any, operation: Callable[[], Any], duration: float,
+                        warmup: int, power_reader: PowerReader | None,
+                        power_interval: float) -> tuple[float, int, dict[str, Any] | None]:
+    for _ in range(warmup):
+        operation()
+    torch.mps.synchronize()
+    # Bounded command batches keep Metal busy without accumulating an unbounded graph.
+    started = time.perf_counter()
+    operation()
+    torch.mps.synchronize()
+    pilot = max(time.perf_counter() - started, 1e-6)
+    chunk = max(1, min(64, math.ceil(0.05 / pilot)))
+    sampler = PowerSampler(power_reader, power_interval)
+    sampler.start()
+    runs = 0
+    started = time.perf_counter()
+    try:
+        while runs < 3 or time.perf_counter() - started < duration:
+            for _ in range(chunk):
+                operation()
+            torch.mps.synchronize()
+            runs += chunk
+        elapsed = time.perf_counter() - started
+    finally:
+        power = sampler.stop(time.perf_counter() - started)
+    return elapsed, runs, power
+
+
+def _torch_device(backend: str) -> str:
+    return "mps" if backend == "mps" else "cuda"
+
+
+def _empty_cache(torch: Any, backend: str) -> None:
+    (torch.mps if backend == "mps" else torch.cuda).empty_cache()
 
 
 class SyntheticCNN:
@@ -176,17 +219,28 @@ def run_gpu_benchmarks(
     device_architecture: str | None = None,
     precisions: set[str] | None = None,
     include_idle: bool = True,
+    apple_memory_limit_gib: float = 0,
 ) -> list[dict[str, Any]]:
     import torch
 
     results: list[dict[str, Any]] = []
     benchmark_duration = _duration(profile, requested_duration)
     for index in device_indices:
-        torch.cuda.set_device(index)
-        properties = torch.cuda.get_device_properties(index)
-        device = f"{index}: {properties.name}"
+        if backend == "mps":
+            from .apple import apple_hardware, unified_memory_budget
+            if index != 0 or not torch.backends.mps.is_available():
+                raise RuntimeError("MPS 仅支持可用的设备 0")
+            hardware = apple_hardware()
+            total_memory = unified_memory_budget(hardware["unified_memory_bytes"], torch.mps.recommended_max_memory(), apple_memory_limit_gib)
+            torch.mps.set_per_process_memory_fraction(total_memory / torch.mps.recommended_max_memory())
+            device = f"0: {hardware['name']} / MPS"
+        else:
+            torch.cuda.set_device(index)
+            properties = torch.cuda.get_device_properties(index)
+            total_memory = properties.total_memory
+            device = f"{index}: {properties.name}"
         power_reader = make_power_reader(backend, index) if power_enabled else None
-        size = matrix_size or _auto_matrix_size(properties.total_memory, profile)
+        size = matrix_size or _auto_matrix_size(total_memory, profile)
         active_batch = batch_size or _profile_value(profile, 2, 8, 16)
 
         if power_enabled and include_idle:
@@ -212,7 +266,7 @@ def run_gpu_benchmarks(
                     torch,
                     backend,
                     device,
-                    properties.total_memory,
+                    total_memory,
                     profile,
                     benchmark_duration,
                     warmup,
@@ -236,7 +290,16 @@ def run_gpu_benchmarks(
                 )
             )
 
-        torch.cuda.empty_cache()
+        if backend == "mps":
+            for item in results:
+                item["details"].update(
+                    timing="synchronized_wall_clock", memory_type="unified",
+                    memory_budget_bytes=total_memory,
+                    mps_prefer_metal=os.environ.get("PYTORCH_MPS_PREFER_METAL", "0"),
+                    mps_fast_math=os.environ.get("PYTORCH_MPS_FAST_MATH", "0"),
+                    cpu_fallback=False,
+                )
+        _empty_cache(torch, backend)
         gc.collect()
     return results
 
@@ -262,8 +325,8 @@ def _run_matmul(
     for label, dtype, tf32 in cases:
         try:
             with _matmul_mode(torch, backend, tf32), torch.inference_mode():
-                left = torch.randn((size, size), device="cuda", dtype=dtype)
-                right = torch.randn((size, size), device="cuda", dtype=dtype)
+                left = torch.randn((size, size), device=_torch_device(backend), dtype=dtype)
+                right = torch.randn((size, size), device=_torch_device(backend), dtype=dtype)
                 output = None
 
                 def operation() -> None:
@@ -271,7 +334,7 @@ def _run_matmul(
                     output = torch.mm(left, right)
 
                 elapsed, runs, power = _time_gpu_operation(
-                    torch, operation, duration, warmup, power_reader, power_interval
+                    torch, operation, duration, warmup, power_reader, power_interval, backend
                 )
                 operations = 2.0 * size**3 * runs
                 tflops = operations / elapsed / 1e12
@@ -293,7 +356,7 @@ def _run_matmul(
         except (RuntimeError, TypeError) as exc:
             results.append(_skipped(backend, device, "compute", "dense_matmul", label, exc))
         finally:
-            torch.cuda.empty_cache()
+            _empty_cache(torch, backend)
     return results
 
 
@@ -312,14 +375,14 @@ def _run_memory(
         cap = _profile_value(profile, 64, 256, 512) * 1024**2
         tensor_bytes = min(cap, max(16 * 1024**2, total_memory // 32))
         elements = tensor_bytes // 4
-        source = torch.empty(elements, device="cuda", dtype=torch.float32).normal_()
+        source = torch.empty(elements, device=_torch_device(backend), dtype=torch.float32).normal_()
         destination = torch.empty_like(source)
 
         def operation() -> None:
             destination.copy_(source)
 
         elapsed, runs, power = _time_gpu_operation(
-            torch, operation, duration, warmup, power_reader, power_interval
+            torch, operation, duration, warmup, power_reader, power_interval, backend
         )
         transferred = 2.0 * source.numel() * source.element_size() * runs
         result = _result(
@@ -370,8 +433,11 @@ def _run_inference(
                     test = "synthetic_mlp"
                     unit = "samples/s"
                 else:
-                    model = SyntheticCNN(torch).eval().to(device="cuda", dtype=dtype)
-                    inputs = torch.randn((batch_size, 3, 224, 224), device="cuda", dtype=dtype)
+                    model = SyntheticCNN(torch).eval().to(device=_torch_device(backend), dtype=dtype)
+                    inputs = torch.randn((batch_size, 3, 224, 224), device=_torch_device(backend), dtype=dtype)
+                    if backend == "mps":
+                        model = model.to(memory_format=torch.channels_last)
+                        inputs = inputs.contiguous(memory_format=torch.channels_last)
                     test = "synthetic_cnn"
                     unit = "images/s"
                 output = None
@@ -381,7 +447,7 @@ def _run_inference(
                     output = model(inputs)
 
                 elapsed, runs, power = _time_gpu_operation(
-                    torch, operation, duration, warmup, power_reader, power_interval
+                    torch, operation, duration, warmup, power_reader, power_interval, backend
                 )
                 samples_per_second = batch_size * runs / elapsed
                 timing_details = {
@@ -412,7 +478,7 @@ def _run_inference(
             test = "synthetic_mlp" if compatibility_fallback else "synthetic_cnn"
             results.append(_skipped(backend, device, "inference", test, label, exc))
         finally:
-            torch.cuda.empty_cache()
+            _empty_cache(torch, backend)
     return results
 
 

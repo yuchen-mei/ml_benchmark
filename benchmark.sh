@@ -5,7 +5,7 @@ ulimit -c 0 2>/dev/null || true
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 log() {
-  printf '[mlbench] %s\n' "$*"
+  printf '[mlbench] %s\n' "$*" >&2
 }
 
 has_module() {
@@ -21,12 +21,16 @@ try:
 except (ImportError, OSError, ValueError):
     pass
 import torch
-if not torch.cuda.is_available():
+if torch.backends.mps.is_available():
+    device = "mps"
+elif torch.cuda.is_available():
+    device = "cuda"
+else:
     raise SystemExit(1)
-value = torch.ones((32, 32), dtype=torch.float16, device="cuda")
+value = torch.ones((32, 32), dtype=torch.float16, device=device)
 value = torch.mm(value, value)
 float(value.sum().item())
-torch.cuda.synchronize()
+(torch.mps if device == "mps" else torch.cuda).synchronize()
 """
 try:
     completed = subprocess.run(
@@ -66,7 +70,7 @@ raise SystemExit(0 if completed.returncode == 0 else 1)' >/dev/null 2>&1
 }
 
 has_accelerator_runtime() {
-  has_torch_accelerator "$1" || has_vitis_runtime "$1"
+  has_torch_accelerator "$1" || has_vitis_runtime "$1" || has_module "$1" mlx.core
 }
 
 find_npu_python() {
@@ -260,7 +264,7 @@ detect_amd_gpu_arch() {
   for device_file in /sys/class/drm/card[0-9]*/device/device; do
     [[ -r "${device_file}" ]] || continue
     device_id="$(<"${device_file}")"
-    case "${device_id,,}" in
+    case "${device_id}" in
       0x1586) architecture="gfx1151" ;;
     esac
     [[ -n "${architecture}" ]] && break
@@ -300,6 +304,10 @@ detect_cuda_index() {
 }
 
 AMD_GPU_ARCH="$(detect_amd_gpu_arch)"
+APPLE_SILICON=0
+if [[ "$(uname -s)" == "Darwin" && "$(uname -m)" == "arm64" ]]; then
+  APPLE_SILICON=1
+fi
 if [[ -n "${MLBENCH_VENV:-}" ]]; then
   VENV_DIR="${MLBENCH_VENV}"
 elif [[ "${AMD_GPU_ARCH}" == "gfx1151" ]]; then
@@ -343,11 +351,12 @@ PYTHON_BIN="$(pick_python)" || {
   printf '错误: 需要 Python 3.10 或更高版本。\n' >&2
   exit 2
 }
-LLM_PRESET="$(requested_option --llm-preset qwen "$@")"
-LLM_QUANTIZATION="$(requested_option --llm-quantization auto "$@")"
+LLM_PRESET="$(requested_option --llm-preset all "$@")"
+LLM_QUANTIZATION="$(requested_option --llm-quantization all "$@")"
+LLM_QUANTIZATION="$(requested_option --llm-dtype "${LLM_QUANTIZATION}" "$@")"
 LLM_MODEL="$(requested_option --llm-model "" "$@")"
 
-if ! has_accelerator_runtime "${PYTHON_BIN}" && [[ "${PYTHON_BIN}" != "${VENV_DIR}/bin/python" ]]; then
+if [[ "${MLBENCH_NO_INSTALL:-0}" != "1" ]] && ! has_accelerator_runtime "${PYTHON_BIN}" && [[ "${PYTHON_BIN}" != "${VENV_DIR}/bin/python" ]]; then
   PYTHON_VERSION="$(${PYTHON_BIN} -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
   if ! "${PYTHON_BIN}" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)'; then
     printf '错误: 选择到的 Python %s 太旧，请设置 MLBENCH_PYTHON。\n' "${PYTHON_VERSION}" >&2
@@ -364,7 +373,26 @@ if [[ "${MLBENCH_NO_INSTALL:-0}" != "1" ]]; then
     "${PYTHON_BIN}" -m pip install "numpy>=1.23"
   fi
 
-  if [[ "${REQUESTED_BACKEND}" != "cpu" && "${REQUESTED_BACKEND}" != "npu" ]] && ! has_torch_accelerator "${PYTHON_BIN}"; then
+  if [[ "${APPLE_SILICON}" == "1" ]]; then
+    if ! "${PYTHON_BIN}" -c 'import platform, sys; sys.exit(platform.machine() != "arm64")'; then
+      printf '错误: Apple Silicon 加速需要原生 arm64 Python，请设置 MLBENCH_PYTHON。\n' >&2
+      exit 2
+    fi
+    if [[ "${REQUESTED_BACKEND}" == "all" || "${REQUESTED_BACKEND}" == "mps" ]] && ! llm_requested "$@" && ! has_torch_accelerator "${PYTHON_BIN}"; then
+      log "安装 Apple Metal/MPS PyTorch"
+      "${PYTHON_BIN}" -m pip install --upgrade 'torch>=2.5'
+    fi
+    if [[ "${REQUESTED_BACKEND}" == "all" || "${REQUESTED_BACKEND}" == "mlx" ]] && ! has_module "${PYTHON_BIN}" mlx.core; then
+      log "安装 Apple MLX Metal 运行时"
+      "${PYTHON_BIN}" -m pip install 'mlx>=0.31,<0.33'
+    fi
+    if [[ "${REQUESTED_BACKEND}" == "all" || "${REQUESTED_BACKEND}" == "coreml" ]] && ! llm_requested "$@" && ! has_module "${PYTHON_BIN}" coremltools; then
+      log "安装 Apple Core ML / Neural Engine 运行时"
+      "${PYTHON_BIN}" -m pip install 'coremltools>=9,<10'
+    fi
+  fi
+
+  if [[ "${APPLE_SILICON}" != "1" && "${REQUESTED_BACKEND}" != "cpu" && "${REQUESTED_BACKEND}" != "npu" ]] && ! has_torch_accelerator "${PYTHON_BIN}"; then
     TORCH_INSTALL_ARGS=(install --upgrade)
     if has_module "${PYTHON_BIN}" torch; then
       log "当前 PyTorch 可枚举 GPU，但真实张量探针失败；将重装匹配的发行包"
@@ -411,17 +439,25 @@ EOF
   fi
 
   if llm_requested "$@"; then
-    if ! has_module "${PYTHON_BIN}" transformers || ! has_module "${PYTHON_BIN}" accelerate; then
-      log "安装端到端 LLM 测试依赖"
-      "${PYTHON_BIN}" -m pip install "transformers>=4.51,<5" "accelerate>=1.0" "safetensors>=0.4"
-    fi
-    if [[ "${LLM_QUANTIZATION}" == "4bit" || "${LLM_QUANTIZATION}" == "8bit" || \
-          ( "${LLM_QUANTIZATION}" == "auto" && "${LLM_PRESET}" == "kimi" && -z "${LLM_MODEL}" ) ]]; then
-      if ! has_module "${PYTHON_BIN}" bitsandbytes; then
-        log "安装 Kimi/量化 LLM 测试依赖 bitsandbytes"
-        if ! "${PYTHON_BIN}" -m pip install "bitsandbytes>=0.49"; then
-          printf '错误: bitsandbytes 安装失败，请确认当前 CUDA/ROCm GPU 在其支持范围内。\n' >&2
-          exit 2
+    if [[ "${APPLE_SILICON}" == "1" && ( "${REQUESTED_BACKEND}" == "all" || "${REQUESTED_BACKEND}" == "mlx" ) ]]; then
+      if ! has_module "${PYTHON_BIN}" mlx_lm; then
+        log "安装 Apple MLX LLM 依赖"
+        "${PYTHON_BIN}" -m pip install 'mlx-lm>=0.31,<0.32'
+      fi
+    else
+      if ! has_module "${PYTHON_BIN}" transformers || ! has_module "${PYTHON_BIN}" accelerate; then
+        log "安装端到端 LLM 测试依赖"
+        "${PYTHON_BIN}" -m pip install "transformers>=4.51,<5" "accelerate>=1.0" "safetensors>=0.4"
+      fi
+      if [[ "${LLM_QUANTIZATION}" == "all" || "${LLM_QUANTIZATION}" == "4bit" || "${LLM_QUANTIZATION}" == "8bit" || \
+            ( "${LLM_QUANTIZATION}" == "auto" && ( "${LLM_PRESET}" == "kimi" || "${LLM_PRESET}" == "all" ) && -z "${LLM_MODEL}" ) ]]; then
+        if ! has_module "${PYTHON_BIN}" bitsandbytes; then
+          log "安装 Kimi/量化 LLM 测试依赖 bitsandbytes"
+          if ! "${PYTHON_BIN}" -m pip install "bitsandbytes>=0.49"; then
+            printf '错误: bitsandbytes 安装失败，请确认当前 CUDA/ROCm GPU 在其支持范围内。\n' >&2
+            if [[ "${LLM_QUANTIZATION}" != "all" ]]; then exit 2; fi
+            log "继续执行可用精度；报告将记录量化依赖不可用的组合"
+          fi
         fi
       fi
     fi

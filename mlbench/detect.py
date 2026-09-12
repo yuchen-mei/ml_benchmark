@@ -14,6 +14,7 @@ from typing import Any
 
 from .npu_runtime import npu_subprocess_environment
 from .runtime import process_exit_reason
+from .apple import apple_hardware, probe_apple_runtime
 
 
 _TORCH_PROBE_PREFIX = "__MLBENCH_TORCH_PROBE__="
@@ -36,7 +37,17 @@ try:
         "cuda_build": getattr(torch.version, "cuda", None),
         "hip_build": getattr(torch.version, "hip", None),
     })
-    if not torch.cuda.is_available():
+    if torch.backends.mps.is_available():
+        payload["mps_available"] = False
+        left = torch.ones((32, 32), dtype=torch.float16, device="mps")
+        result = torch.mm(left, left)
+        torch.mps.synchronize()
+        if float(result[0, 0].item()) != 32:
+            raise RuntimeError("MPS matmul probe returned incorrect output")
+        payload["mps_recommended_memory_bytes"] = torch.mps.recommended_max_memory()
+        payload["mps_available"] = True
+        payload["probe"] = {"status": "ok"}
+    elif not torch.cuda.is_available():
         payload["probe"] = {
             "status": "unavailable",
             "reason": "torch.cuda.is_available() returned False",
@@ -307,15 +318,31 @@ def detect_environment() -> dict[str, Any]:
     nvidia = _nvidia_hardware()
     amd_gpu = _amd_gpu_hardware()
     amd_npu = _amd_npu_hardware()
+    apple = apple_hardware()
+    mlx_info = probe_apple_runtime("mlx") if apple.get("detected") else {}
+    coreml_info = probe_apple_runtime("coreml") if apple.get("detected") else {}
 
     available: list[str] = []
     if torch_info.get("available"):
         available.append("rocm" if torch_info.get("hip_build") else "cuda")
     if "VitisAIExecutionProvider" in ort_info.get("providers", []):
         available.append("npu")
+    if torch_info.get("mps_available"):
+        available.append("mps")
+    if mlx_info.get("available"):
+        available.append("mlx")
+    if coreml_info.get("available"):
+        available.append("coreml")
     available.append("cpu")
 
     warnings = []
+    if apple.get("detected"):
+        if not apple.get("native_arm64"):
+            warnings.append("Apple Silicon 正在使用 Rosetta/x86 Python；请改用原生 arm64 Python。")
+        for name in ("mps", "mlx", "coreml"):
+            if name not in available:
+                detail = {"mps": torch_info.get("probe", {}), "mlx": mlx_info, "coreml": coreml_info}[name]
+                warnings.append(f"Apple Silicon {name} 不可用：{detail.get('reason', '未安装或未获得设备访问权限')}。")
     if nvidia and "cuda" not in available:
         warnings.append("检测到 NVIDIA GPU，但当前 Python 的 PyTorch CUDA 不可用。")
     if amd_gpu and "rocm" not in available:
@@ -341,8 +368,9 @@ def detect_environment() -> dict[str, Any]:
             "nvidia_gpus": nvidia,
             "amd_gpus": amd_gpu,
             "amd_npu": amd_npu,
+            "apple_silicon": apple,
         },
-        "runtime": {"torch": torch_info, "onnxruntime": ort_info},
+        "runtime": {"torch": torch_info, "onnxruntime": ort_info, "mlx": mlx_info, "coreml": coreml_info},
         "available_backends": available,
         "warnings": warnings,
     }
@@ -364,6 +392,12 @@ def render_doctor(environment: dict[str, Any]) -> str:
         f"PyTorch    : {_runtime_line(runtime['torch'])}",
         f"ONNX RT    : {_runtime_line(runtime['onnxruntime'])}",
     ]
+    if hardware.get("apple_silicon", {}).get("detected"):
+        lines.extend([
+            f"Apple 芯片 : {_compact_json(hardware['apple_silicon'])}",
+            f"MLX        : {_compact_json(runtime.get('mlx', {}))}",
+            f"Core ML    : {_compact_json(runtime.get('coreml', {}))}",
+        ])
     if environment["warnings"]:
         lines.append("-" * 58)
         lines.extend(f"警告       : {warning}" for warning in environment["warnings"])
@@ -384,6 +418,8 @@ def _runtime_line(runtime: dict[str, Any]) -> str:
         if runtime.get("external"):
             line += f"; python={runtime.get('executable')}"
         return line
+    if runtime.get("mps_available"):
+        return f"{version}; Metal/MPS; accelerator=True"
     if runtime.get("hip_build"):
         backend = "HIP/ROCm"
     elif runtime.get("cuda_build"):

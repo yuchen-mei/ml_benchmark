@@ -1,10 +1,10 @@
 # Heterogeneous MLBench
 
-一个面向 **NVIDIA GPU、AMD GPU（ROCm）和 AMD Ryzen AI NPU** 的一键 ML 算力测试工具。它会自动识别本机可用后端，在同一份报告里输出矩阵算力、显存带宽、CNN 推理吞吐、真实 LLM 生成性能、功耗与性能每瓦。
+一个面向 **NVIDIA GPU、AMD GPU（ROCm）、AMD Ryzen AI NPU 和 Apple Silicon GPU/Neural Engine** 的一键 ML 算力测试工具。它会自动识别本机可用后端，在同一份报告里输出矩阵算力、显存/统一内存带宽、CNN 推理吞吐、真实 LLM 生成性能，以及运行时支持的功耗与性能每瓦。
 
 ## 一键运行
 
-Linux / WSL：
+macOS / Linux / WSL：
 
 ```bash
 chmod +x benchmark.sh
@@ -17,7 +17,7 @@ Windows PowerShell：
 .\benchmark.ps1
 ```
 
-默认使用 `standard` 档位并以 100 ms 间隔采样功耗，结果写入 `results/mlbench_*.json` 和 `results/mlbench_*.md`。第一次运行可能创建 `.venv` 并安装 NumPy/PyTorch；Strix Halo 使用独立的 `.venv-gfx1151`，只有选择 `llm` 档位时才会按需安装 Transformers/Accelerate。驱动和 ROCm/Ryzen AI 系统运行时不会被脚本擅自修改。
+默认使用 `standard` 档位并以 100 ms 间隔采样功耗，结果写入 `results/mlbench_*.json` 和 `results/mlbench_*.md`。第一次运行可能创建 `.venv` 并安装 NumPy/PyTorch，Apple Silicon 还会安装 MLX/Core ML；Strix Halo 使用独立的 `.venv-gfx1151`，只有选择 `llm` 档位时才会按需安装 Transformers/Accelerate 或 MLX-LM。驱动和 ROCm/Ryzen AI 系统运行时不会被脚本擅自修改。
 
 终端结果按设备分组，并按照 Unicode 实际显示宽度对齐中文表头；终端宽度不足时自动切换为逐项纵向布局，避免换行破坏列结构。
 
@@ -41,21 +41,104 @@ Windows PowerShell：
 | AMD GPU | PyTorch HIP/ROCm + `amd-smi`/`rocm-smi` | FP32/FP16/BF16 GEMM、显存拷贝、CNN/兼容 MLP 推理、功耗 |
 | NVIDIA / AMD GPU | Transformers `generate()` | Llama、Qwen、DeepSeek、Kimi 真实权重端到端生成、TTFT、prefill/decode 吞吐、峰值显存、功耗 |
 | AMD Ryzen AI NPU | ONNX Runtime VitisAI EP + `xrt-smi` | Ryzen AI quicktest CNN 吞吐、P50/P95 延迟、首次编译时间、可用时的功耗 |
+| Apple Silicon GPU | PyTorch MPS / Metal | FP32/FP16/BF16 GEMM、统一内存拷贝、channels-last CNN |
+| Apple Silicon GPU | MLX / Metal | FP32/FP16/BF16 GEMM、连续转置带宽、编译后的 NHWC CNN、原生量化 LLM |
+| Apple Neural Engine | Core ML | FP16 静态 CNN、并发吞吐、P50/P95、编译缓存、设备分配计划 |
 | CPU 回退 | NumPy | FP32 GEMM、内存拷贝 |
 
 PyTorch 的 ROCm 版本沿用 `torch.cuda` Python API，所以 GPU 基准核心不需要维护两份实现。NPU 默认复用当前 Ryzen AI 安装包自带且已针对 NPU 量化的 quicktest CNN，首次运行会由 VitisAI EP 编译并缓存；也可用 `--npu-model` 指定其他 ONNX 模型。
 
-## 24GB LLM 端到端档位
-
-默认命令会下载并测试 Qwen3 4B 的真实权重，负载为每请求 `512` 个输入 token、强制生成 `128` 个 token、batch 1，测量 3 轮：
+## LLM 默认全量测试
 
 ```bash
 ./benchmark.sh --profile llm
 ```
 
-可选预设均以单张不超过 24GB 显存为目标：
+默认遍历 **Llama、Qwen、DeepSeek、Kimi** 四个现有预设；每个模型分别测试 **FP32、FP16、BF16、8bit、4bit**，每种精度测量 **128、256、512、1024、2048 tokens** 的 prefill 与后续端到端生成。每个后端/设备共尝试 **100 个组合**，默认 batch 1、输出 128 tokens、测量 3 轮。浮点精度会显式设置，FP16 和 BF16 分开报告；8bit/4bit 表示权重量化，其他计算仍可能使用浮点精度。
 
-| 预设 | 官方模型 | 默认加载方式 | 保守预检占用 | 额外要求 |
+```bash
+# 只选择一个模型，其余精度和长度仍遍历
+./benchmark.sh --profile llm --llm-preset qwen
+
+# 只测试一个模型、一个精度、一个输入长度
+./benchmark.sh --profile llm --llm-preset qwen --llm-dtype fp16 --llm-prompt-tokens 2048
+
+# 自定义输入长度列表
+./benchmark.sh --profile llm --llm-preset deepseek --llm-dtype bf16 --llm-prompt-tokens 512,1024,2048
+```
+
+`--llm-dtype` 是 `--llm-quantization` 的别名，默认值为 `all`。原有 `auto` 和 `none` 仍可显式选择。指定 `--llm-model` 时只测试该自定义模型，不再遍历预设；其精度和输入长度仍按其他参数决定。已量化权重无法替代原始浮点权重完成全部精度比较，建议全量测试使用未量化模型。
+
+每个组合使用独立子进程和新的 KV cache，复用下载缓存但重新加载模型。下载、转换和加载不计入生成吞吐。一个组合失败不会终止其他组合；缺少模型许可、精度不受支持、超出内存/上下文限制、运行时崩溃等都会记录原因。Llama 官方仓库仍需先接受许可并提供 `HF_TOKEN`；Kimi VL 当前不支持 MLX 文本路径，因此 Mac 上的 Kimi 组合会明确标记未完成。CUDA/ROCm 测试 Kimi 仍需 `--trust-remote-code`，不会自动授权执行仓库代码。
+
+JSON/Markdown 报告在每个组合结束后更新；中途停止时保留已有结果，JSON 的 `complete=false` 表示未完成遍历。终端按模型汇总精度、输入长度、TTFT、prefill/decode/端到端吞吐和峰值内存。全部尝试结束后 `complete=true`；若有组合失败，退出码为 3。
+
+## Apple Silicon：M4 / M5 / Pro / Max / Ultra
+
+使用原生 **arm64 Python** 与较新的 macOS。M5 系列建议使用 **macOS 26.2 或更高版本**和当前 MLX，以使用 GPU 内的 Neural Accelerators。它们与独立的 **Neural Engine（ANE）** 是两种硬件：MLX/Metal 使用 GPU，Core ML 调度 ANE。本工具不硬编码 M5 型号或核心数，报告使用实际检测到的芯片。参见 [Apple 的 MLX / M5 说明](https://machinelearning.apple.com/research/exploring-llms-mlx-m5)。
+
+```bash
+# 自动安装依赖并依次测试 MPS、MLX、Core ML；不下载大模型
+./benchmark.sh --profile quick
+
+# 较充分地测试 Max 的大矩阵和 CNN 吞吐
+./benchmark.sh --profile extended
+
+# 单独测 GPU
+./benchmark.sh --backend mlx --profile extended
+./benchmark.sh --backend mps --profile extended
+
+# 比较 PyTorch 的 Metal matmul 与 MPSGraph，选择本机更快的路径
+./benchmark.sh --backend mps --suite compute --mps-matmul metal
+./benchmark.sh --backend mps --suite compute --mps-matmul mpsgraph
+
+# ANE：默认比较 CPU_AND_NE 与 ALL；可增加并发请求
+./benchmark.sh --backend coreml --npu-streams 4 --duration 10
+./benchmark.sh --backend coreml --coreml-compute-units cpu_and_ne
+# CPU 基线；也支持 cpu_and_gpu
+./benchmark.sh --backend coreml --coreml-compute-units cpu_only
+```
+
+MPS 禁止不支持的算子静默回退 CPU，使用同步后的实际耗时；MLX 强制选择 GPU，并实际执行每次计算后计时，避免把惰性建图速度当作算力。CNN 的 MPS 路径使用 channels-last，MLX 使用 NHWC 与 `mx.compile`。FP32/FP16/BF16 分别报告。`--mps-matmul auto` 使用 PyTorch/环境默认选择；`PYTORCH_MPS_FAST_MATH=1` 可手动启用近似数学，报告记录该选项，不默认牺牲数值精度。
+
+`--apple-memory-limit-gib 0` 为自动预算：取物理内存的 75%、Metal 推荐工作集、为系统保留 4 GiB 后的容量三者最小值；也可设更小的固定上限。128 GiB 机器通常得到 96 GiB 预算。该预算是共享内存，不是独占显存；请为其他应用保留空间。MPS 设置进程内存限制，MLX 设置分配器建议值，并检查模型、prefill 分块、decode 与峰值内存。不会修改系统 wired-memory 参数。
+
+Core ML 直接生成固定尺寸的 FP16 ML Program，不依赖 PyTorch 转换器。模型和编译缓存位于 `results/cache/coreml/`，按图版本、batch、Core ML Tools 和 macOS 版本隔离。首次转换/编译/加载与预热不计入稳定态吞吐，并发请求使用独立模型实例。`CPU_AND_NE` 允许 CPU 回退，`ALL` 允许系统选择 CPU/GPU/ANE，不保证三者同时满载。终端与报告注明编译计划是否包含 ANE，JSON 保留首选设备的操作数；这是编译计划，**不是实测 NPU 占用率或纯 NPU TOPS**。
+
+Apple 功耗目前标记为不支持，不输出伪造的瓦数或能效。各后端依次执行，便于独立比较；不会把多个后端竞争同一 GPU/内存带宽的成绩相加。MLX 的 `device_transpose` 强制物化连续转置，不能与 MPS 的 `device_copy` 当成相同负载。
+
+### Apple MLX 大模型
+
+```bash
+# 全部模型、精度与 prefill 档位；首次下载真实权重
+./benchmark.sh --backend mlx --profile llm
+
+# 更长 prefill 可测试 M5 GPU 矩阵加速器，batch 可调整
+./benchmark.sh --backend mlx --profile llm --llm-preset qwen --llm-prompt-tokens 2048 \
+  --llm-new-tokens 256 --llm-runs 5 --apple-memory-limit-gib 64
+
+# 使用已有 MLX 模型，包括预量化模型；不会访问网络
+./benchmark.sh --backend mlx --profile llm --llm-model /models/my-mlx-model \
+  --llm-local-files-only --llm-quantization auto
+```
+
+Mac 的 `--backend all --profile llm` 自动选择 MLX。支持 Qwen、Llama、DeepSeek 文本预设和 MLX-LM 兼容模型；Kimi VL 多模态预设不在此路径中。`auto` 保留已有量化；未量化模型在加载后转成原生 4bit，也可选 `8bit` 或 `none`。在线量化需要先装入完整权重，大模型建议提前准备 MLX 量化权重。`--trust-remote-code` 同时控制自定义模型与 tokenizer 代码。
+
+MLX 使用固定长度贪心生成，每次请求重新建立 KV cache，在同一条生成链中分别测量首 token、prefill 和 decode，并记录包括输入构造/输出解码的端到端吞吐。MLX 的 TTFT 包含输入数组构造，与 CUDA/ROCm 的 GPU 驻留输入计时有细微差别。MLX 使用 `--apple-memory-limit-gib`，不使用 CUDA/ROCm 的 `--llm-vram-limit-gib` / `--llm-vram-reserve-gib`；峰值字段沿用 `llm_peak_vram`，`memory_type=unified` 标明实际含义。
+
+手动安装：`python -m pip install -e '.[apple,apple-llm]'`。MLX-LM 当前使用 Transformers 5，而 CUDA/ROCm 的 `llm` extra 固定 Transformers 4；请使用各自环境与 extra，避免混装。启动器只在请求 LLM 时安装 MLX-LM；`doctor` 与 `MLBENCH_NO_INSTALL=1` 不安装依赖。
+
+## 24GB LLM 端到端档位（CUDA / ROCm）
+
+默认行为见上面的全量测试。下面的命令保留原有单组 Qwen3 4B 测试：每请求输入 `512` tokens、输出 `128` tokens、自动选择 BF16/FP16、batch 1、测量 3 轮。
+
+```bash
+./benchmark.sh --profile llm --llm-preset qwen --llm-quantization auto --llm-prompt-tokens 512
+```
+
+各预设的 `auto` 模式以单张不超过 24GB 显存为目标；全量测试中的 FP32 等更大精度可能超预算并被跳过：
+
+| 预设 | 官方模型 | `auto` 加载方式 | 保守预检占用 | 额外要求 |
 |---|---|---:|---:|---|
 | `llama` | [Llama 3.2 3B Instruct](https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct) | BF16/FP16 | 约 7 GiB | 先接受许可并设置 `HF_TOKEN` |
 | `qwen` | [Qwen3 4B Instruct 2507](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507) | BF16/FP16 | 约 9 GiB | 无 |
@@ -70,8 +153,8 @@ PyTorch 的 ROCm 版本沿用 `torch.cuda` Python API，所以 GPU 基准核心�
 # Llama 官方仓库受许可保护
 HF_TOKEN=hf_xxx ./benchmark.sh --profile llm --llm-preset llama
 
-# Kimi 官方小型开放权重仍有 16B 总参数，因此默认采用 4bit
-./benchmark.sh --profile llm --llm-preset kimi --trust-remote-code
+# Kimi 官方小型开放权重仍有 16B 总参数，24GB 显存建议指定 4bit
+./benchmark.sh --profile llm --llm-preset kimi --llm-quantization 4bit --trust-remote-code
 ```
 
 安全预算取“物理显存、当前空闲显存、24 GiB”三者的最小值，再默认保留 2 GiB。工具先按预设估算拦截，再检查模型实际占用和生成峰值；模型会被强制完整放在一张 GPU 上，检测到 CPU/磁盘卸载便终止，避免用变慢的 offload 结果冒充 GPU 成绩。48GB 卡也仍按 24GB 上限测试，16GB 卡则自动收紧到当前可用容量。
@@ -96,7 +179,7 @@ HF_TOKEN=hf_xxx ./benchmark.sh --profile llm --llm-preset llama
   --llm-local-files-only
 ```
 
-`llm` 不会加入普通 `--suite all`，以免日常测试意外下载数 GB 权重；也不与 GEMM/CNN 混跑，以免缓存和显存状态污染功耗结果。当前通用 LLM 档位只支持 CUDA/ROCm GPU，Ryzen AI NPU 仍运行静态 CNN 路径。Kimi 的 4bit 路径依赖 [bitsandbytes 支持的硬件后端](https://github.com/bitsandbytes-foundation/bitsandbytes/blob/main/docs/source/installation.mdx)，部分 ROCm 版本或 GPU 可能暂不兼容。
+`llm` 不会加入普通 `--suite all`，以免日常测试意外下载数 GB 权重；也不与 GEMM/CNN 混跑，以免缓存和显存状态污染功耗结果。Transformers LLM 档位支持 CUDA/ROCm GPU，Apple GPU 使用上面的 MLX 路径；NPU 仍运行静态 CNN 路径。Kimi 的 4bit 路径依赖 [bitsandbytes 支持的硬件后端](https://github.com/bitsandbytes-foundation/bitsandbytes/blob/main/docs/source/installation.mdx)，部分 ROCm 版本或 GPU 可能暂不兼容。
 
 ## 运行时准备
 
@@ -261,3 +344,12 @@ PYTHONPATH=. python -m mlbench run --backend cpu --profile quick
 - [XRT SMI electrical/telemetry](https://xilinx.github.io/XRT/master/html/xrt-smi.html)
 - [Transformers 文本生成参数](https://huggingface.co/docs/transformers/main_classes/text_generation)
 - [Transformers 大模型加载与 device map](https://huggingface.co/docs/transformers/main/models)
+
+Apple 官方运行时文档：
+
+- [MLX 与 M5 GPU Neural Accelerators](https://machinelearning.apple.com/research/exploring-llms-mlx-m5)
+- [PyTorch MPS 配置](https://docs.pytorch.org/docs/stable/mps_environment_variables.html)
+- [Core ML compute plan](https://apple.github.io/coremltools/docs-guides/source/mlmodel-utilities.html)
+- [MLX-LM](https://github.com/ml-explore/mlx-lm)
+
+开发验证：`python -m unittest discover -s tests -v`。Apple 实机集成测试（不下载权重）：`MLBENCH_TEST_APPLE=1 python -m unittest discover -s tests -v`。

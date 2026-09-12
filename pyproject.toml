@@ -5,12 +5,18 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "hetero-mlbench"
 version = "0.3.3"
-description = "One-click ML benchmark for NVIDIA GPUs and AMD GPUs/NPUs"
+description = "One-click ML benchmark for NVIDIA, AMD and Apple Silicon GPUs/NPUs"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.23"]
 
 [project.optional-dependencies]
+apple = [
+    "torch>=2.5; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "mlx>=0.31,<0.33; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "coremltools>=9,<10; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+apple-llm = ["mlx-lm>=0.31,<0.32; sys_platform == 'darwin' and platform_machine == 'arm64'"]
 llm = ["transformers>=4.51,<5", "accelerate>=1.0", "safetensors>=0.4"]
 llm-quant = [
     "transformers>=4.51,<5",
